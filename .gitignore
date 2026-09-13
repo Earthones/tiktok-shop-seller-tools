@@ -1,0 +1,5 @@
+# Only reviewed release files belong in this public repository.
+/*
+!/.gitignore
+!/README.md
+!/tiktok-shop-partial-refund.user.js
