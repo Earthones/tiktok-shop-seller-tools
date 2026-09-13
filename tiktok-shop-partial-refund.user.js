@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.19.3
+// @version      0.19.4
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
-// @description  Alt+T 查看符合条件的待退货订单，并通过卖家中心 Reverse API SDK 发送 10% 部分退款提议。
+// @description  Alt+T 显示或隐藏卖家工具箱功能条；通过 Reverse SDK 处理售后，刷新或切换站点后停止自动计划。
 // @match        https://seller.tiktokshopglobalselling.com/*
 // @match        https://seller-vn.tiktok.com/*
 // @run-at       document-start
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.19.3";
+  const APP_VERSION = "0.19.4";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -151,7 +151,11 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   let ui;
   let siteSettings = loadSiteSettings();
   let activeSiteContext = contextFromUrl(window.location.href);
+  let pageSiteSignals = readPageSiteSignals();
+  if (pageSiteSignals.sellerCookie) activeSiteContext.sellerId = pageSiteSignals.sellerCookie;
   let latestListContext = activeSiteContext;
+  let siteContextRevision = 0;
+  let pageSiteWatchTimer = null;
   const responseContexts = new WeakMap();
 
   function availableSites() {
@@ -239,20 +243,82 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       siteId: observed.siteId !== "unknown" ? observed.siteId : sellerChanged ? "unknown" : activeSiteContext.siteId,
     };
     const regionChanged = next.siteId !== "unknown" && activeSiteContext.siteId !== "unknown" && next.siteId !== activeSiteContext.siteId;
-    activeSiteContext = next;
     if (sellerChanged || regionChanged) {
+      siteContextRevision += 1;
+      stopAutomation({ node: "切换站点停止", reason: "检测到站点或店铺切换，原自动计划已停止，请在目标站点手动重新启用。" });
       sdkPromise = undefined;
       state.eligibleOrders = [];
       deliveredState.orders = [];
       refundOnlyState.orders = [];
       state.lastListResponse = deliveredState.lastListResponse = refundOnlyState.lastListResponse = null;
-      if (automationState.running) automationState.cancelRequested = true;
+    }
+    activeSiteContext = next;
+    if (sellerChanged || regionChanged) {
       renderOrders(); renderDeliveredOrders(); renderRefundOnlyOrders();
     }
     return { ...next };
   }
 
+  function readPageSiteSignals() {
+    // 仅读取当前店铺标识，不读取/保存登录令牌。主站切换国家有时只更新这个 Cookie。
+    let sellerCookie = "";
+    try {
+      sellerCookie = document.cookie.match(/(?:^|;\s*)oec_seller_id_unified_seller_env=(\d+)(?:;|$)/)?.[1] || "";
+    } catch {}
+    return { ...contextFromUrl(window.location.href), sellerCookie };
+  }
+
+  function checkPageSiteContext() {
+    const previous = pageSiteSignals;
+    const current = readPageSiteSignals();
+    pageSiteSignals = current;
+    if ((current.siteId !== "unknown" && current.siteId !== previous.siteId) ||
+        (current.sellerId && current.sellerId !== previous.sellerId)) {
+      observeSiteContext(window.location.href);
+    }
+    if (current.sellerCookie && current.sellerCookie !== previous.sellerCookie) {
+      const url = new URL(window.location.href);
+      url.searchParams.set("oec_seller_id", current.sellerCookie);
+      observeSiteContext(url.href);
+    } else if (previous.sellerCookie && !current.sellerCookie) {
+      siteContextRevision += 1;
+      stopAutomation({ node: "店铺状态变化停止", reason: "当前店铺标识已失效，自动计划已停止，请确认登录和站点后重新启用。" });
+    }
+  }
+
+  function startPageSiteWatcher() {
+    clearInterval(pageSiteWatchTimer);
+    pageSiteWatchTimer = setInterval(checkPageSiteContext, 1000);
+  }
+
+  function installPageSiteObserver() {
+    for (const method of ["pushState", "replaceState"]) {
+      const original = history[method];
+      history[method] = function (...args) {
+        const result = Reflect.apply(original, this, args);
+        checkPageSiteContext();
+        return result;
+      };
+    }
+    window.addEventListener("popstate", checkPageSiteContext);
+    startPageSiteWatcher();
+  }
+
+  function createRequestGuard() {
+    checkPageSiteContext();
+    const revision = siteContextRevision;
+    const automaticPlanId = automationState.running ? automationState.runningPlanId : "";
+    return () => {
+      checkPageSiteContext();
+      if (revision !== siteContextRevision) throw new Error("站点或店铺已切换，已阻止继续发送旧操作。");
+      if (automaticPlanId && (automationState.runningPlanId !== automaticPlanId || !automationShouldContinue())) {
+        throw new Error("自动计划已停止，已阻止继续发送请求。");
+      }
+    };
+  }
+
   function assertOrderContext(order) {
+    checkPageSiteContext();
     if (order.sellerId && activeSiteContext.sellerId && order.sellerId !== activeSiteContext.sellerId) {
       throw new Error("当前店铺已切换，请刷新订单列表后再处理。");
     }
@@ -1474,6 +1540,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   installListFetchObserver();
+  installPageSiteObserver();
 
   function normalizePayload(input) {
     const reverseOrderId = String(
@@ -1546,6 +1613,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       throw new Error("缺少明确确认，已阻止退款请求。");
     }
 
+    const guard = createRequestGuard();
     const payload = normalizePayload(input);
     const previousSuccess = getSuccessRecord(
       payload.reverse_main_order_id,
@@ -1556,6 +1624,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     }
 
     const { api } = await loadSdk();
+    guard();
     assertOrderContext(input);
     const result = await parseSdkResult(
       await api.ActionPartialRefund(payload),
@@ -1598,6 +1667,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     buildRequest,
     renderProgress,
   }) {
+    const guard = createRequestGuard();
     const allCards = [];
     const pageOffsets = [];
     const pageSizes = [];
@@ -1605,6 +1675,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     let batchContext = null;
 
     for (let pageIndex = 0; pageIndex < MAX_PAGES; pageIndex += 1) {
+      guard();
       const offset = pageIndex * PAGE_SIZE;
       const requestBody = buildRequest(offset);
       renderProgress(
@@ -1620,6 +1691,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       } finally {
         state.internalListRequestDepth -= 1;
       }
+      guard();
 
       if (result?.code !== 0) {
         throw new Error(
@@ -1903,6 +1975,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       throw new Error("缺少明确确认，已阻止已送达退货拒绝请求。");
     }
 
+    const guard = createRequestGuard();
     const normalizedId = String(reverseMainOrderId || "").trim();
     if (!/^\d+$/.test(normalizedId)) {
       throw new Error("售后退款单号 reverse_main_order_id 必须是纯数字。");
@@ -1919,6 +1992,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       operation_client: 0,
     };
     const { api } = await loadSdk();
+    guard();
     const result = await parseSdkResult(
       await api.ActionReturnParcelReject(payload),
     );
@@ -1973,6 +2047,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       throw new Error("缺少明确确认，已阻止仅退款拒绝请求。");
     }
 
+    const guard = createRequestGuard();
     const normalizedId = String(reverseMainOrderId || "").trim();
     if (!/^\d+$/.test(normalizedId)) {
       throw new Error("售后退款单号 reverse_main_order_id 必须是纯数字。");
@@ -2005,6 +2080,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       operation_client: 0,
     };
     const { api } = await loadSdk();
+    guard();
     const result = await parseSdkResult(
       await api.ActionReturnApplyReject(payload),
     );
@@ -3204,15 +3280,18 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       `下次运行：${settings.enabled && !limit ? formatAutomationTime(settings.nextRunAt) : "无"}`,
       `网络：${navigator.onLine === false ? "离线" : "在线"} · 待恢复补跑：${settings.missedRunAt ? "有（合并为一轮）" : "无"}`,
       `上次结果：${settings.lastSummary || "尚未运行"}`,
-      "一次勾选的所有按钮合计一轮；成功、失败、无订单均计1次。刷新页面保留累计次数。",
+      "一次勾选的所有按钮合计一轮；成功、失败、无订单均计1次。刷新或切换站点后停止计划，保留设置和累计次数。",
+      "停止后需要手动重新启用；自动按钮：黑色＝已停止，橙色＝计划已启用（含等待运行）。",
       "请保持页面、浏览器和登录状态可用；错过的时间点不会连续补跑。",
       "离线错过的任务恢复联网后合并补跑一次；两轮启动相隔不足5分钟则跳过并记日志，不计次数。",
     ].join("\n");
     ui.automationStatus.className = `show ${settings.enabled ? "ok" : ""}`;
     ui.automationEnable.disabled = running;
     ui.automationDisable.disabled = !settings.enabled && !running;
-    ui.automationTool?.classList.toggle("active", settings.enabled && !limit);
-    ui.automationTool?.setAttribute("title", `自动运行：已启动 ${settings.startedRuns}/${settings.maxRuns > 0 ? settings.maxRuns : "不限"} 轮`);
+    const active = settings.enabled && (!limit || running) && !automationState.cancelRequested;
+    ui.automationTool?.classList.toggle("active", active);
+    ui.automationTool?.setAttribute("aria-pressed", String(active));
+    ui.automationTool?.setAttribute("title", `自动运行：${active ? "已启用" : "已停止"}；已启动 ${settings.startedRuns}/${settings.maxRuns > 0 ? settings.maxRuns : "不限"} 轮`);
   }
 
   function populateAutomationForm() {
@@ -3266,6 +3345,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   function automationShouldContinue() {
+    checkPageSiteContext();
     const latest = loadAutomationSettings();
     return Boolean(
       latest.enabled && latest.planId === automationState.runningPlanId &&
@@ -3334,6 +3414,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   async function runLockedAutomationCycle() {
+    checkPageSiteContext();
     automationState.settings = loadAutomationSettings();
     const settings = automationState.settings;
     if (!settings.enabled) { renderAutomationStatus(); return; }
@@ -3464,6 +3545,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   function enableAutomationFromForm() {
     if (automationState.running) return;
+    checkPageSiteContext();
+    const startingSiteRevision = siteContextRevision;
     updateAutomationFirstRunMin();
     const selected = {
       delivered: ui.automationDelivered.checked,
@@ -3491,6 +3574,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     if (first.getTime() <= updateAutomationFirstRunMin()) {
       window.alert("确认期间首次运行时间已过，请重新选择未来时间。原有计划未改变。"); return;
     }
+    checkPageSiteContext();
+    if (startingSiteRevision !== siteContextRevision) {
+      window.alert("确认期间站点或店铺已切换，原计划已停止。请核对目标站点后重新启用。"); return;
+    }
     automationState.cancelRequested = false;
     automationState.settings = {
       ...getDefaultAutomationSettings(),
@@ -3507,32 +3594,36 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     armAutomationTimer();
   }
 
-  function disableAutomation() {
+  function stopAutomation({ node = "取消", reason = "已取消自动运行" } = {}) {
+    const settings = loadAutomationSettings();
+    const hadPlan = settings.enabled || Boolean(settings.nextRunAt || settings.missedRunAt) ||
+      (automationState.running && !automationState.cancelRequested);
     automationState.cancelRequested = true;
     clearAutomationTimer();
-    const settings = loadAutomationSettings();
-    const wasEnabled = settings.enabled;
     settings.enabled = false;
     settings.nextRunAt = "";
-    settings.lastSummary = automationState.running ? "已请求停止，等待当前请求结束" : "已取消自动运行";
+    settings.missedRunAt = "";
+    if (hadPlan) settings.lastSummary = reason + (automationState.running ? " 已发出的请求可能仍会完成，后续请求不再发送。" : "");
     automationState.settings = settings;
-    saveAutomationSettings();
+    if (hadPlan) saveAutomationSettings();
     if (!automationState.running) releaseAutomationLock();
-    if (wasEnabled || automationState.running) recordSuccessLog({
-      type: "自动运行", node: "取消", reason: `已启动 ${settings.startedRuns} 轮；${settings.lastSummary}`,
+    if (hadPlan) recordSuccessLog({
+      type: "自动运行", node, reason: `已启动 ${settings.startedRuns} 轮；${settings.lastSummary}`,
     });
     renderAutomationStatus();
+  }
+
+  function disableAutomation() {
+    stopAutomation();
   }
 
   function initializeAutomation() {
     automationState.settings = loadAutomationSettings();
     const settings = automationState.settings;
-    if (settings.enabled && !settings.nextRunAt && !automationLimitReached(settings)) {
-      settings.firstRunAt ||= new Date(Date.now() + settings.intervalMinutes * 60000).toISOString();
-      settings.nextRunAt = settings.firstRunAt;
-      saveAutomationSettings();
+    clearAutomationTimer();
+    if (settings.enabled || settings.nextRunAt || settings.missedRunAt) {
+      stopAutomation({ node: "页面重新加载停止", reason: "页面刷新或重新打开，原自动计划已停止，请手动重新启用。" });
     }
-    armAutomationTimer();
     populateAutomationForm();
   }
 
@@ -3711,6 +3802,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           transition: transform .22s ease, box-shadow .22s ease;
         }
         #launcher.dragging { transition: none; cursor: grabbing; box-shadow: 0 12px 30px rgba(0,0,0,.3); }
+        #launcher[hidden] { display: none; }
         #launcher.docked {
           left: auto !important; right: 0 !important; bottom: auto !important;
           transform: translateX(calc(100% - 22px));
@@ -3733,8 +3825,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #tool-log:hover { border-color: #8b5cf6; background: #8b5cf6; }
         #tool-settings { border-color: #475569; color: #fff; background: #475569; }
         #tool-settings:hover { background: #64748b; }
-        #tool-automation { border-color: #ea580c; color: #fff; background: #ea580c; }
-        #tool-automation:hover, #tool-automation.active { border-color: #f97316; background: #f97316; }
+        #tool-automation, #tool-automation:hover { border-color: #475569; color: #fff; background: #000000; }
+        #tool-automation.active, #tool-automation.active:hover { border-color: #f97316; background: #f97316; }
         #overlay, #delivered-overlay, #refund-only-overlay, #log-overlay, #automation-overlay, #settings-overlay {
           display: none; position: fixed; inset: 0; z-index: 2147483647;
           align-items: center; justify-content: center; padding: 24px;
@@ -3874,7 +3966,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           </div>
           <pre id="status"></pre>
           <div id="orders"></div>
-          <div class="shortcut">快捷键：Alt + T 显示或隐藏此窗口</div>
+          <div class="shortcut">快捷键：Alt + T 仅显示或隐藏功能条，不切换此窗口</div>
         </section>
       </div>
       <div id="refund-only-overlay" role="dialog" aria-labelledby="refund-only-title">
@@ -4201,7 +4293,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       }, 260);
     });
     window.addEventListener("resize", () => {
-      if (ui.launcher.classList.contains("docked")) return;
+      if (ui.launcher.hidden || ui.launcher.classList.contains("docked")) return;
       const rect = ui.launcher.getBoundingClientRect();
       const position = clampLauncherPosition(rect.left, rect.top);
       ui.launcher.style.left = `${position.left}px`;
@@ -4221,10 +4313,9 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       refreshOrderList().catch(() => {});
     };
     const closeReturnRefund = () => ui.overlay.classList.remove("open");
-    const toggleReturnRefund = () =>
-      ui.overlay.classList.contains("open")
-        ? closeReturnRefund()
-        : openReturnRefund();
+    const toggleLauncher = () => {
+      ui.launcher.hidden = !ui.launcher.hidden;
+    };
     const openRefundOnly = () => {
       ui.settingsOverlay.classList.remove("open");
       ui.deliveredOverlay.classList.remove("open");
@@ -4432,11 +4523,12 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       if (
         event.altKey &&
         !event.ctrlKey &&
+        !event.metaKey &&
         !event.shiftKey &&
         event.key.toLowerCase() === "t"
       ) {
         event.preventDefault();
-        toggleReturnRefund();
+        if (!event.repeat) toggleLauncher();
       }
     });
 
@@ -4476,13 +4568,19 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     window.addEventListener(
       "pagehide",
       () => {
-        automationState.cancelRequested = true;
-        clearAutomationTimer();
+        stopAutomation({ node: "页面离开停止", reason: "页面刷新或离开，原自动计划已停止，请手动重新启用。" });
+        clearInterval(pageSiteWatchTimer);
+        pageSiteWatchTimer = null;
         clearInterval(automationState.lockHeartbeat);
         releaseAutomationLock();
       },
-      { once: true },
     );
+    window.addEventListener("pageshow", (event) => {
+      if (!event.persisted) return;
+      stopAutomation({ node: "页面恢复停止", reason: "页面从浏览器历史恢复，原自动计划保持停止，请手动重新启用。" });
+      checkPageSiteContext();
+      startPageSiteWatcher();
+    });
   }
 
   if (document.readyState === "loading") {
