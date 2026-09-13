@@ -4,6 +4,8 @@
 
 ## 安装与更新
 
+访问条件：下面的固定地址在仓库公开后可供油猴直接读取。私有仓库仅作源码备份；仅在浏览器登录 GitHub，不保证油猴能读取私有 raw 地址，也不要把访问令牌写进脚本或更新链接。
+
 安装油猴后，打开 [脚本安装 / 更新地址](https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js)，在油猴中确认安装或更新。
 
 已有旧版本时，用这个地址更新同一个脚本；保留脚本名称与 namespace，不要同时启用两份脚本。
