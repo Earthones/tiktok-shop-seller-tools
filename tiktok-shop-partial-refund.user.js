@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.19.4
+// @version      0.19.5
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.19.4";
+  const APP_VERSION = "0.19.5";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -662,9 +662,9 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   function logCategory(entry) {
-    if (String(entry.type).includes("退货退款")) return "按钮3_退货退款";
-    if (String(entry.type).includes("仅退款")) return "按钮2_仅退款";
-    if (String(entry.type).includes("已送达")) return "按钮1_已送达";
+    if (String(entry.type).includes("退货退款")) return "退货退款";
+    if (String(entry.type).includes("仅退款")) return "仅退款";
+    if (String(entry.type).includes("已送达")) return "已送达";
     return "系统日志";
   }
 
@@ -698,9 +698,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     const selected = new Set(selectedSites);
     if (!selected.size) return [];
     const groups = new Map();
-    const headers = ["时间", "时区", "站点", "站点标识", "币种", "功能类别", "处理结果", "普通订单号", "售后退款单号", "执行节点", "结果或原因", "店铺ID", "页面域名"];
-    const identifierColumns = new Set(["普通订单号", "售后退款单号", "店铺ID"]);
-    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const headers = ["时间", "功能", "处理结果", "订单号", "售后退款单号", "执行节点", "结果"];
+    const identifierColumns = new Set(["订单号", "售后退款单号"]);
     const modeLabel = mode === "normal" ? "普通日志" : "全量日志";
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") continue;
@@ -714,18 +713,12 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       if (!groups.has(filename)) groups.set(filename, []);
       groups.get(filename).push({
         "时间": formatExportTime(entry.timestamp),
-        "时区": timeZone,
-        "站点": site?.label || "未归属站点",
-        "站点标识": siteId,
-        "页面域名": entry.sourceHost || "",
-        "店铺ID": String(entry.sellerId || ""),
-        "币种": entry.currency || site?.currency || "",
-        "功能类别": category,
-        "普通订单号": String(entry.mainOrderId || ""),
+        "功能": category,
+        "订单号": String(entry.mainOrderId || ""),
         "售后退款单号": String(entry.reverseMainOrderId || ""),
         "处理结果": entry.status || "",
         "执行节点": entry.node || "",
-        "结果或原因": entry.reason || "",
+        "结果": entry.reason || "",
       });
     }
     return [...groups].map(([name, rows]) => {
@@ -3656,8 +3649,13 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       ui.settingsRows.append(row);
     }
     syncExportSelectAll();
-    ui.settingsStatus.textContent = `当前页面：${window.location.hostname}\n最近保存：${siteSettings.savedAt ? formatExportTime(siteSettings.savedAt) : "尚无保存时间（旧设置仍会保留）"}\n保存后刷新或重启浏览器会自动恢复；清理网站数据或换浏览器前请备份设置 JSON。主站与独立越南分别保存。`;
-    ui.settingsStatus.className = "show";
+    setSettingsFeedback();
+  }
+
+  function setSettingsFeedback(message = "", error = false) {
+    ui.settingsFeedback.textContent = message;
+    ui.settingsFeedback.hidden = !message;
+    ui.settingsFeedback.className = error ? "error" : "ok";
   }
 
   function selectedExportSitesFromForm() {
@@ -3694,11 +3692,9 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         exportSites: selectedExportSitesFromForm(),
       };
       const backupWarning = persistSiteSettings(updated);
-      ui.settingsStatus.textContent = `设置已保存到浏览器（${formatExportTime(siteSettings.savedAt)}），刷新及重启后自动恢复。\n可点击“备份设置 JSON”保存独立文件；备份仅含站点阈值与导出勾选，不含登录凭据或自动计划。${backupWarning}`;
-      ui.settingsStatus.className = "show ok";
+      setSettingsFeedback(`设置已保存。${backupWarning}`, Boolean(backupWarning));
     } catch (error) {
-      ui.settingsStatus.textContent = error.message || String(error);
-      ui.settingsStatus.className = "show error";
+      setSettingsFeedback(error.message || String(error), true);
     }
   }
 
@@ -3710,56 +3706,9 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     siteSettings = saved;
     let backupWarning = "";
     try { localStorage.setItem(SETTINGS_BACKUP_STORAGE_KEY, text); }
-    catch { backupWarning = "\n浏览器内备份写入失败，建议下载 JSON 备份。"; }
+    catch { backupWarning = "浏览器内备份写入失败，请检查存储空间。"; }
     renderOrders(); renderRefundOnlyOrders();
     return backupWarning;
-  }
-
-  function backupSiteSettings() {
-    try {
-      const saved = loadSiteSettings();
-      const backup = {
-        kind: "tiktok-shop-seller-tools-settings", schemaVersion: 1,
-        sourceHost: window.location.hostname, exportedAt: new Date().toISOString(), settings: saved,
-      };
-      downloadBlob(new Blob([JSON.stringify(backup, null, 2)], { type: "application/json;charset=utf-8" }),
-        `tiktok-shop-settings-${window.location.hostname}-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
-      ui.settingsStatus.textContent = "已发起设置 JSON 备份下载。备份的是已保存设置，未保存的表单修改不包含在内。";
-      ui.settingsStatus.className = "show ok";
-    } catch (error) {
-      ui.settingsStatus.textContent = error?.message || String(error);
-      ui.settingsStatus.className = "show error";
-    }
-  }
-
-  async function importSiteSettings(file) {
-    if (!file) return;
-    try {
-      if (file.size > 128 * 1024) throw new Error("设置文件超过 128 KiB，请选择工具箱导出的 JSON 备份。");
-      const backup = JSON.parse((await file.text()).replace(/^\uFEFF/, ""));
-      if (backup?.kind !== "tiktok-shop-seller-tools-settings" || backup.schemaVersion !== 1) throw new Error("不是支持的工具箱设置备份文件。");
-      if (backup.sourceHost !== window.location.hostname) throw new Error("备份所属域名与当前页面不一致，请在对应主站或独立越南站导入。");
-      const input = backup.settings;
-      if (!input || !input.thresholds || typeof input.thresholds !== "object" || Array.isArray(input.thresholds) || !Array.isArray(input.exportSites)) throw new Error("设置备份结构不完整。");
-      const thresholds = { ...loadSiteSettings().thresholds };
-      for (const site of availableSites()) {
-        const value = input.thresholds[site.id];
-        if (typeof value !== "string") throw new Error(`${site.label}阈值字段无效。`);
-        const text = value.trim(), units = text === "" ? null : decimalUnits(text, site.decimals);
-        if (text !== "" && units == null) throw new Error(`${site.label}阈值格式无效。`);
-        thresholds[site.id] = text === "" ? "" : formatUnits(units, site.decimals);
-      }
-      if (input.exportSites.some((id) => !availableSites().some((site) => site.id === id))) throw new Error("备份包含不属于当前页面的导出站点。");
-      const updated = { thresholds, exportSites: [...new Set(input.exportSites)] };
-      if (!window.confirm("确认导入设置？\n将替换当前域名的站点金额阈值和日志导出勾选；不会启动或更改自动计划，也不会发送订单请求。")) return;
-      const warning = persistSiteSettings(updated);
-      renderSettingsForm();
-      ui.settingsStatus.textContent = `设置已导入并保存到浏览器，未改变自动运行计划。${warning}`;
-      ui.settingsStatus.className = "show ok";
-    } catch (error) {
-      ui.settingsStatus.textContent = `导入失败：${error?.message || String(error)}`;
-      ui.settingsStatus.className = "show error";
-    }
   }
 
   async function exportLogsFromSettings(mode = "full") {
@@ -3769,11 +3718,9 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const selected = selectedExportSitesFromForm();
       if (!selected.length) throw new Error("请至少勾选一个需要导出日志的站点。");
       const result = await exportPersistentLogs({ siteIds: selected, mode });
-      ui.settingsStatus.textContent = `已导出${mode === "normal" ? "普通" : "全量"}日志 ${result.entryCount} 条，共 ${result.fileCount} 个 CSV 文件${result.archive ? "（已打包为 ZIP，请解压后用 WPS 打开）" : ""}。在“处理结果”列筛选“失败”即可查看失败记录。`;
-      ui.settingsStatus.className = "show ok";
+      setSettingsFeedback(`已导出 ${result.entryCount} 条日志，${result.fileCount} 个 CSV${result.archive ? "（ZIP）" : ""}。`);
     } catch (error) {
-      ui.settingsStatus.textContent = error.message || String(error);
-      ui.settingsStatus.className = "show error";
+      setSettingsFeedback(error.message || String(error), true);
     } finally {
       ui.settingsExport.disabled = false;
       ui.settingsExportNormal.disabled = false;
@@ -3918,9 +3865,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         .settings-table th, .settings-table td { padding: 10px 6px; border-bottom: 1px solid #e2e8f0; text-align: left; }
         .settings-table input[type="text"] { width: 145px; }
         .settings-form select, .settings-form input[type="text"] { font: inherit; padding: 7px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; }
-        #settings-status { margin: 0; padding: 12px; white-space: pre-wrap; background: #e2e8f0; border-radius: 8px; }
-        #settings-status.ok { color: #166534; background: #dcfce7; }
-        #settings-status.error { color: #991b1b; background: #fee2e2; }
+        #settings-feedback { font-size: 13px; margin-right: auto; }
+        #settings-feedback[hidden] { display: none; }
+        #settings-feedback.ok { color: #166534; }
+        #settings-feedback.error { color: #991b1b; }
       </style>
       <div id="launcher" aria-label="卖家工具箱" title="拖动按钮区域可移动工具箱">
         <div class="tool-buttons">
@@ -4018,11 +3966,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="settings-form">
             <p class="hint">阈值比较商品原金额，同时应用于按钮3和按钮2的 10% 部分退款；按钮2的拒绝操作不受金额阈值影响。</p>
             <table class="settings-table"><thead><tr><th>站点</th><th>币种与精度</th><th>金额阈值</th><th>导出日志</th></tr></thead><tbody id="settings-rows"></tbody></table>
-            <p class="hint">全量 CSV：勾选站点的包裹、自动运行及异常日志；未归属站点的记录另存一份。普通 CSV：只含具体包裹的成功/失败，不含自动调度记录，但保留自动处理产生的逐包裹结果。</p>
-            <p class="hint">时间按浏览器时区精确到秒。UTF-8 中文编码，长单号按文本保护；WPS 可在“处理结果”列筛选“失败”。每站一份 CSV，多份打包 ZIP；两个域名分别导出。</p>
-            <pre id="settings-status"></pre>
-            <div class="toolbar automation-actions"><button id="settings-save" type="button">保存设置</button><button id="settings-backup" type="button">备份设置 JSON</button><button id="settings-import" type="button">导入设置 JSON</button><input id="settings-import-file" type="file" accept=".json,application/json" hidden></div>
-            <div class="toolbar automation-actions"><button id="settings-export" type="button">导出全量 CSV</button><button id="settings-export-normal" type="button">导出普通 CSV</button><label><input id="settings-select-all" type="checkbox">全选／全不选</label></div>
+            <div class="toolbar automation-actions"><span id="settings-feedback" role="status" aria-live="polite" hidden></span><button id="settings-save" type="button">保存设置</button><button id="settings-export" type="button">导出全量 CSV</button><button id="settings-export-normal" type="button">导出普通 CSV</button><label><input id="settings-select-all" type="checkbox">全选／全不选</label></div>
           </div>
         </section>
       </div>
@@ -4080,11 +4024,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       settingsOverlay: root.getElementById("settings-overlay"),
       settingsClose: root.getElementById("settings-close"),
       settingsRows: root.getElementById("settings-rows"),
-      settingsStatus: root.getElementById("settings-status"),
+      settingsFeedback: root.getElementById("settings-feedback"),
       settingsSave: root.getElementById("settings-save"),
-      settingsBackup: root.getElementById("settings-backup"),
-      settingsImport: root.getElementById("settings-import"),
-      settingsImportFile: root.getElementById("settings-import-file"),
       settingsExport: root.getElementById("settings-export"),
       settingsExportNormal: root.getElementById("settings-export-normal"),
       settingsSelectAll: root.getElementById("settings-select-all"),
@@ -4463,13 +4404,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     });
     ui.settingsClose.addEventListener("click", closeSettings);
     ui.settingsSave.addEventListener("click", saveSiteSettingsFromForm);
-    ui.settingsBackup.addEventListener("click", backupSiteSettings);
-    ui.settingsImport.addEventListener("click", () => ui.settingsImportFile.click());
-    ui.settingsImportFile.addEventListener("change", () => {
-      const file = ui.settingsImportFile.files?.[0];
-      ui.settingsImportFile.value = "";
-      importSiteSettings(file);
-    });
     ui.settingsExport.addEventListener("click", () => exportLogsFromSettings("full"));
     ui.settingsExportNormal.addEventListener("click", () => exportLogsFromSettings("normal"));
     ui.settingsOverlay.addEventListener("click", (event) => {
