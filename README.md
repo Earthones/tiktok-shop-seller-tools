@@ -4,15 +4,23 @@
 
 ## 安装与更新
 
-访问条件：下面的固定地址在仓库公开后可供油猴直接读取。私有仓库仅作源码备份；仅在浏览器登录 GitHub，不保证油猴能读取私有 raw 地址，也不要把访问令牌写进脚本或更新链接。
+本仓库已公开，下面的固定更新地址无需登录即可读取，不需要 Cookie 或 GitHub 访问令牌。不要把访问令牌写进脚本或更新链接。
 
 安装油猴后，打开 [脚本安装 / 更新地址](https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js)，在油猴中确认安装或更新。
 
 已有旧版本时，用这个地址更新同一个脚本；保留脚本名称与 namespace，不要同时启用两份脚本。
 
-当前版本：**0.19.2**。
+如果之前是复制代码安装的旧版，且没有更新地址，需要先从上述地址手动更新一次。不要先卸载旧脚本，也不必重新启用已有自动计划。
+
+当前版本：**0.19.3**。本次启用公开更新地址，退款、金额、定时运行及本地存储逻辑不变。
 
 脚本通过 `@updateURL`、`@downloadURL` 和 `@version` 使用油猴内置更新机制，不在页面内自行下载并执行 GitHub 代码。请在油猴中保持此脚本的更新检查开启。更新周期由油猴设置决定，上传新版后不保证立即更新；也可以在油猴中手动检查更新。
+
+检查更新和下载新版均使用这个固定地址：
+
+```text
+https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
+```
 
 更新字段说明见 [Tampermonkey 官方文档](https://www.tampermonkey.net/documentation.php?locale=en#meta:updateURL)。
 
