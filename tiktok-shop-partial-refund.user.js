@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.19.5
+// @version      0.19.6
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.19.5";
+  const APP_VERSION = "0.19.6";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -57,6 +57,8 @@
   const AUTOMATION_SETTINGS_STORAGE_KEY =
     "tts-seller-tools-automation-settings";
   const AUTOMATION_LOCK_STORAGE_KEY = "tts-seller-tools-automation-lock";
+  // 临时允许多标签页并行；活动计划与最短间隔改为标签页独立，仍保留单页防重入。
+  const ALLOW_MULTI_TAB_AUTOMATION = true;
   const AUTOMATION_MIN_INTERVAL_MINUTES = 5;
   const AUTOMATION_LAST_START_STORAGE_KEY = "tts-seller-tools-automation-last-start";
   const AUTOMATION_MAX_INTERVAL_MINUTES = 1440;
@@ -3185,12 +3187,24 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   function loadAutomationSettings() {
     try {
-      return sanitizeAutomationSettings(JSON.parse(localStorage.getItem(AUTOMATION_SETTINGS_STORAGE_KEY) || "null"));
+      const saved = ALLOW_MULTI_TAB_AUTOMATION
+        ? sessionStorage.getItem(AUTOMATION_SETTINGS_STORAGE_KEY) ?? localStorage.getItem(AUTOMATION_SETTINGS_STORAGE_KEY)
+        : localStorage.getItem(AUTOMATION_SETTINGS_STORAGE_KEY);
+      return sanitizeAutomationSettings(JSON.parse(saved || "null"));
     } catch { return getDefaultAutomationSettings(); }
   }
 
   function saveAutomationSettings() {
-    localStorage.setItem(AUTOMATION_SETTINGS_STORAGE_KEY, JSON.stringify(automationState.settings));
+    const settings = automationState.settings;
+    if (ALLOW_MULTI_TAB_AUTOMATION) {
+      sessionStorage.setItem(AUTOMATION_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+      // 跨页只保存下次打开时的默认参数快照，不共享活动计划的启停状态。
+      localStorage.setItem(AUTOMATION_SETTINGS_STORAGE_KEY, JSON.stringify({
+        ...settings, enabled: false, nextRunAt: "", missedRunAt: "",
+      }));
+    } else {
+      localStorage.setItem(AUTOMATION_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    }
   }
 
   function getSelectedAutomationLabels(settings = automationState.settings) {
@@ -3246,7 +3260,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   function lastAutomationStart(settings) {
-    const saved = Number(localStorage.getItem(AUTOMATION_LAST_START_STORAGE_KEY));
+    const storage = ALLOW_MULTI_TAB_AUTOMATION ? sessionStorage : localStorage;
+    const saved = Number(storage.getItem(AUTOMATION_LAST_START_STORAGE_KEY));
     const fromPlan = Date.parse(settings.lastRunAt);
     return Math.max(Number.isFinite(saved) ? saved : 0, Number.isFinite(fromPlan) ? fromPlan : 0);
   }
@@ -3275,6 +3290,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       `上次结果：${settings.lastSummary || "尚未运行"}`,
       "一次勾选的所有按钮合计一轮；成功、失败、无订单均计1次。刷新或切换站点后停止计划，保留设置和累计次数。",
       "停止后需要手动重新启用；自动按钮：黑色＝已停止，橙色＝计划已启用（含等待运行）。",
+      ...(ALLOW_MULTI_TAB_AUTOMATION ? ["已允许多标签页同时运行；每页独立启停、计数和检查5分钟间隔。同店铺并行可能重复提交订单。"] : []),
       "请保持页面、浏览器和登录状态可用；错过的时间点不会连续补跑。",
       "离线错过的任务恢复联网后合并补跑一次；两轮启动相隔不足5分钟则跳过并记日志，不计次数。",
     ].join("\n");
@@ -3312,6 +3328,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   function acquireAutomationLock() {
+    if (ALLOW_MULTI_TAB_AUTOMATION) return true;
     const now = Date.now();
     const existing = readAutomationLock();
     if (existing?.owner && existing.owner !== automationState.instanceId && Number(existing.expiresAt) > now) return false;
@@ -3322,6 +3339,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   function renewAutomationLock() {
+    if (ALLOW_MULTI_TAB_AUTOMATION) return true;
     try {
       if (readAutomationLock()?.owner !== automationState.instanceId) return false;
       localStorage.setItem(AUTOMATION_LOCK_STORAGE_KEY, JSON.stringify({
@@ -3332,6 +3350,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   function releaseAutomationLock() {
+    if (ALLOW_MULTI_TAB_AUTOMATION) return;
     try {
       if (readAutomationLock()?.owner === automationState.instanceId) localStorage.removeItem(AUTOMATION_LOCK_STORAGE_KEY);
     } catch {}
@@ -3392,8 +3411,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     clearAutomationTimer();
     automationState.acquiringLock = true;
     try {
-      // 浏览器锁保证同一域名的多个标签页不会同时递增次数或提交订单。
-      if (navigator.locks?.request) {
+      // 多页模式不争用跨页锁；上面的 running/acquiringLock 仍阻止本页重入。
+      if (!ALLOW_MULTI_TAB_AUTOMATION && navigator.locks?.request) {
         await navigator.locks.request(AUTOMATION_LOCK_STORAGE_KEY, { ifAvailable: true }, async (lock) => {
           if (lock) await runLockedAutomationCycle();
           else { automationState.settings = loadAutomationSettings(); armAutomationTimer(Date.now() + 10000); }
@@ -3462,15 +3481,18 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     latest.startedRuns = runNumber;
     latest.lastRunAt = new Date(now).toISOString();
     latest.nextRunAt = new Date(nextAutomationSlot(latest)).toISOString();
-    localStorage.setItem(AUTOMATION_LAST_START_STORAGE_KEY, String(now));
+    const automationStartStorage = ALLOW_MULTI_TAB_AUTOMATION ? sessionStorage : localStorage;
+    automationStartStorage.setItem(AUTOMATION_LAST_START_STORAGE_KEY, String(now));
     saveAutomationSettings();
     automationState.running = true;
     automationState.networkInterrupted = false;
     automationState.runningPlanId = planId;
     automationState.cancelRequested = false;
-    automationState.lockHeartbeat = setInterval(() => {
-      if (!renewAutomationLock()) automationState.cancelRequested = true;
-    }, 30000);
+    if (!ALLOW_MULTI_TAB_AUTOMATION) {
+      automationState.lockHeartbeat = setInterval(() => {
+        if (!renewAutomationLock()) automationState.cancelRequested = true;
+      }, 30000);
+    }
     renderAutomationStatus();
     if (recovering) recordSuccessLog({ type: "自动运行", node: "联网恢复补跑", reason: "已将离线漏跑合并为一轮；重新获取列表后处理，不重放旧请求。" });
 
@@ -3562,7 +3584,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     const labels = getSelectedAutomationLabels({ selected });
     const runLimitLabel = maxRuns === -1 ? "不限次数，按间隔一直运行，直到手动取消" : `${maxRuns} 轮后停止`;
     if (!window.confirm(
-      `确认启用自动运行：\n\n功能：${labels.join("、")}\n首次运行：${formatAutomationTime(first.toISOString())}\n间隔：${intervalMinutes} 分钟\n总共运行：${runLimitLabel}（所选按钮合计一轮）\n\n将发送真实请求。重新启用会建立新计划，累计次数从 0 开始。是否确认？`
+      `确认启用自动运行：\n\n功能：${labels.join("、")}\n首次运行：${formatAutomationTime(first.toISOString())}\n间隔：${intervalMinutes} 分钟\n总共运行：${runLimitLabel}（所选按钮合计一轮）\n\n将发送真实请求。重新启用会建立新计划，累计次数从 0 开始。${ALLOW_MULTI_TAB_AUTOMATION ? "同店铺多个页面同时运行，可能重复提交同一订单。" : ""}是否确认？`
     )) return;
     if (first.getTime() <= updateAutomationFirstRunMin()) {
       window.alert("确认期间首次运行时间已过，请重新选择未来时间。原有计划未改变。"); return;
@@ -3613,6 +3635,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   function initializeAutomation() {
     automationState.settings = loadAutomationSettings();
     const settings = automationState.settings;
+    if (ALLOW_MULTI_TAB_AUTOMATION) {
+      // 首次载入锁定本页快照，后续其它页面保存默认参数不会改变本页计划。
+      sessionStorage.setItem(AUTOMATION_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    }
     clearAutomationTimer();
     if (settings.enabled || settings.nextRunAt || settings.missedRunAt) {
       stopAutomation({ node: "页面重新加载停止", reason: "页面刷新或重新打开，原自动计划已停止，请手动重新启用。" });
@@ -4487,7 +4513,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         renderOrders(); renderRefundOnlyOrders();
         return;
       }
-      if (event.key !== AUTOMATION_SETTINGS_STORAGE_KEY) return;
+      if (event.key !== AUTOMATION_SETTINGS_STORAGE_KEY || ALLOW_MULTI_TAB_AUTOMATION) return;
       const incoming = loadAutomationSettings();
       automationState.settings = incoming;
       if (!incoming.enabled || (automationState.running && incoming.planId !== automationState.runningPlanId)) {
