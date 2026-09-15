@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.19.6
+// @version      0.19.8
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.19.6";
+  const APP_VERSION = "0.19.8";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -373,16 +373,25 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     }
   }
 
+  function compareLogsNewestFirst(a, b) {
+    const first = Date.parse(a?.timestamp);
+    const second = Date.parse(b?.timestamp);
+    // Keep undated legacy entries, but place them after dated records.
+    if (!Number.isFinite(first)) return Number.isFinite(second) ? 1 : 0;
+    if (!Number.isFinite(second)) return -1;
+    return second - first;
+  }
+
   function loadActivityLogs() {
     try {
       const current = localStorage.getItem(ACTIVITY_LOG_STORAGE_KEY);
       const legacy = localStorage.getItem(LEGACY_FAILURE_LOG_STORAGE_KEY);
       const parsed = JSON.parse(current || legacy || "[]");
       return Array.isArray(parsed)
-        ? parsed.slice(0, MAX_ACTIVITY_LOG_ENTRIES).map((entry) => ({
+        ? parsed.map((entry) => ({
             ...entry,
             status: entry?.status || "失败",
-          }))
+          })).sort(compareLogsNewestFirst).slice(0, MAX_ACTIVITY_LOG_ENTRIES)
         : [];
     } catch {
       return [];
@@ -734,66 +743,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     });
   }
 
-  // 无外部依赖的 ZIP（Store 格式），一次下载，内含多个按条件拆分的日志文件。
-  function createLogZip(files) {
-    const encoder = new TextEncoder();
-    const table = new Uint32Array(256);
-    for (let n = 0; n < 256; n += 1) {
-      let c = n;
-      for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      table[n] = c >>> 0;
-    }
-    const crc32 = (bytes) => {
-      let crc = 0xffffffff;
-      for (const byte of bytes) crc = table[(crc ^ byte) & 255] ^ (crc >>> 8);
-      return (crc ^ 0xffffffff) >>> 0;
-    };
-    const localParts = [], centralParts = [];
-    let offset = 0, centralSize = 0;
-    for (const file of files) {
-      const name = encoder.encode(file.name);
-      const content = encoder.encode(file.content);
-      const crc = crc32(content);
-      const header = new Uint8Array(30 + name.length);
-      const view = new DataView(header.buffer);
-      view.setUint32(0, 0x04034b50, true);
-      view.setUint16(4, 20, true);
-      view.setUint16(6, 0x0800, true);
-      view.setUint16(12, 33, true);
-      view.setUint32(14, crc, true);
-      view.setUint32(18, content.length, true);
-      view.setUint32(22, content.length, true);
-      view.setUint16(26, name.length, true);
-      header.set(name, 30);
-      localParts.push(header, content);
-
-      const central = new Uint8Array(46 + name.length);
-      const cv = new DataView(central.buffer);
-      cv.setUint32(0, 0x02014b50, true);
-      cv.setUint16(4, 20, true);
-      cv.setUint16(6, 20, true);
-      cv.setUint16(8, 0x0800, true);
-      cv.setUint16(14, 33, true);
-      cv.setUint32(16, crc, true);
-      cv.setUint32(20, content.length, true);
-      cv.setUint32(24, content.length, true);
-      cv.setUint16(28, name.length, true);
-      cv.setUint32(42, offset, true);
-      central.set(name, 46);
-      centralParts.push(central);
-      centralSize += central.length;
-      offset += header.length + content.length;
-    }
-    const end = new Uint8Array(22);
-    const ev = new DataView(end.buffer);
-    ev.setUint32(0, 0x06054b50, true);
-    ev.setUint16(8, files.length, true);
-    ev.setUint16(10, files.length, true);
-    ev.setUint32(12, centralSize, true);
-    ev.setUint32(16, offset, true);
-    return new Blob([...localParts, ...centralParts, end], { type: "application/zip" });
-  }
-
   async function exportPersistentLogs(options = {}) {
     const mode = options.mode ?? "full";
     const segments = await readPersistentLogSegments();
@@ -812,17 +761,18 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     for (const entry of activityLogState.entries) {
       if (!seen.has(entry.id)) entries.push(entry);
     }
-    entries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+    entries.sort(compareLogsNewestFirst);
     const files = groupLogFiles(
       entries, options.siteIds || siteSettings.exportSites, mode,
     );
     if (!files.length) throw new Error("勾选的站点没有可导出的日志；无法识别站点的旧记录仍保留在持久日志副本中。");
-    const multiple = files.length > 1;
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const blob = multiple ? createLogZip(files) : new Blob([files[0].content], { type: "text/csv;charset=utf-8" });
-    const filename = multiple ? `tiktok-shop-${mode}-logs-${stamp}.zip` : files[0].name.replace(/\.csv$/, `_${stamp}.csv`);
-    downloadBlob(blob, filename);
-    return { mode, archive: multiple, fileCount: files.length, entryCount: files.reduce((total, file) => total + file.count, 0) };
+    for (const file of files) {
+      const blob = new Blob([file.content], { type: "text/csv;charset=utf-8" });
+      downloadBlob(blob, file.name.replace(/\.csv$/, `_${stamp}.csv`));
+    }
+    // Browsers may ask the user to allow multiple downloads; this only initiates them.
+    return { mode, archive: false, fileCount: files.length, entryCount: files.reduce((total, file) => total + file.count, 0) };
   }
 
   function downloadBlob(blob, filename) {
@@ -870,6 +820,9 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     persistActivityLogs();
     queuePersistentLog(entry);
     renderActivityLogs();
+    if (ui?.logOverlay.classList.contains("open")) {
+      ui.root.getElementById("log-panel").scrollTop = 0;
+    }
     const consoleMethod = entry.status === "成功" ? "info" : "error";
     console[consoleMethod]("[卖家工具箱] 操作日志", entry);
     return entry;
@@ -2549,15 +2502,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   function renderActivityLogs() {
     if (!ui?.logEntries) return;
-    const entries = activityLogState.entries;
+    const entries = [...activityLogState.entries].sort(compareLogsNewestFirst);
     ui.logTool.textContent = "Log";
     ui.logSummary.textContent =
-      `界面保留最近 ${entries.length}/${MAX_ACTIVITY_LOG_ENTRIES} 条；` +
-      (activityLogState.segmentCount == null
-        ? "持久日志分卷统计尚未刷新。"
-        : `持久日志共 ${activityLogState.segmentCount} 个分卷、${formatLogBytes(
-            activityLogState.totalBytes,
-          )}，单卷上限 1 MiB、最多 ${MAX_LOG_SEGMENTS} 卷。`);
+      `界面保留最近 ${entries.length}/${MAX_ACTIVITY_LOG_ENTRIES} 条；`;
     ui.logFileState.textContent = activityLogState.fileError
       ? `持久日志异常：${activityLogState.fileError}`
       : "持久日志：IndexedDB 写入正常";
@@ -3288,11 +3236,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       `下次运行：${settings.enabled && !limit ? formatAutomationTime(settings.nextRunAt) : "无"}`,
       `网络：${navigator.onLine === false ? "离线" : "在线"} · 待恢复补跑：${settings.missedRunAt ? "有（合并为一轮）" : "无"}`,
       `上次结果：${settings.lastSummary || "尚未运行"}`,
-      "一次勾选的所有按钮合计一轮；成功、失败、无订单均计1次。刷新或切换站点后停止计划，保留设置和累计次数。",
-      "停止后需要手动重新启用；自动按钮：黑色＝已停止，橙色＝计划已启用（含等待运行）。",
-      ...(ALLOW_MULTI_TAB_AUTOMATION ? ["已允许多标签页同时运行；每页独立启停、计数和检查5分钟间隔。同店铺并行可能重复提交订单。"] : []),
-      "请保持页面、浏览器和登录状态可用；错过的时间点不会连续补跑。",
-      "离线错过的任务恢复联网后合并补跑一次；两轮启动相隔不足5分钟则跳过并记日志，不计次数。",
     ].join("\n");
     ui.automationStatus.className = `show ${settings.enabled ? "ok" : ""}`;
     ui.automationEnable.disabled = running;
@@ -3316,7 +3259,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     // 仅更新新计划表单；旧计划的首次时间、下一次时间和累计次数保持不变。
     ui.automationFirstRun.value = localDateTimeInput(savedFirstRunAt > now ? savedFirstRunAt : defaultFirstRunAt);
     ui.automationMaxRuns.value = String(settings.maxRuns > 0 ? settings.maxRuns : -1);
-    ui.automationTimeZone.textContent = `日期时间按当前浏览器时区 ${Intl.DateTimeFormat().resolvedOptions().timeZone} 填写。新计划默认当前时间＋3分钟，只能选择未来时间；已启用计划以状态栏为准。`;
+    ui.automationTimeZone.textContent = `日期时间为当前浏览器时区 ${Intl.DateTimeFormat().resolvedOptions().timeZone} 。默认设置为当前时间＋3分钟。`;
     renderAutomationStatus();
   }
 
@@ -3744,7 +3687,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const selected = selectedExportSitesFromForm();
       if (!selected.length) throw new Error("请至少勾选一个需要导出日志的站点。");
       const result = await exportPersistentLogs({ siteIds: selected, mode });
-      setSettingsFeedback(`已导出 ${result.entryCount} 条日志，${result.fileCount} 个 CSV${result.archive ? "（ZIP）" : ""}。`);
+      setSettingsFeedback(
+        `已发起下载 ${result.entryCount} 条日志，${result.fileCount} 个 CSV。` +
+        (result.fileCount > 1 ? "如浏览器询问，请允许此站点下载多个文件。" : ""),
+      );
     } catch (error) {
       setSettingsFeedback(error.message || String(error), true);
     } finally {
@@ -3763,14 +3709,28 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
     root.innerHTML = `
       <style>
-        :host { all: initial; }
+        :host {
+          all: initial;
+          --tts-surface: #fff;
+          --tts-card: #fff;
+          --tts-text: #1e293b;
+          --tts-border: #dbe7fb;
+          --tts-accent: #2563eb;
+          --tts-button-border: #3370ff;
+          --tts-button: #fff;
+          --tts-button-hover: #eff6ff;
+        }
         *, *::before, *::after { box-sizing: border-box; }
         button { font: inherit; }
+        input { accent-color: var(--tts-accent); }
+        button:focus-visible, input:focus-visible {
+          outline: 2px solid var(--tts-accent); outline-offset: 3px;
+        }
         #launcher {
           position: fixed; right: 24px; bottom: 24px; z-index: 2147483646;
-          width: 520px; max-width: calc(100vw - 16px); border: 1px solid rgba(255,255,255,.14); border-radius: 13px;
-          padding: 8px; color: #fff; background: #111827; touch-action: none;
-          box-shadow: 0 8px 24px rgba(0,0,0,.22);
+          width: 520px; max-width: calc(100vw - 16px); border: 1px solid var(--tts-border); border-radius: 13px;
+          padding: 8px; color: var(--tts-text); background: var(--tts-surface); touch-action: none;
+          box-shadow: 0 8px 24px rgba(30,64,175,.10);
           font: 14px/1.2 system-ui, sans-serif; user-select: none;
           transition: transform .22s ease, box-shadow .22s ease;
         }
@@ -3783,33 +3743,26 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #launcher.docked.peek { transform: translateX(0); }
         .tool-buttons { display: grid; grid-template-columns: repeat(6, 1fr); gap: 7px; }
         .tool-button {
-          border: 1px solid #475569; border-radius: 8px; padding: 9px 5px;
-          color: #e2e8f0; background: #1e293b; cursor: pointer; white-space: nowrap;
+          border: 1px solid var(--tts-button-border); border-radius: 8px; padding: 9px 5px;
+          color: var(--tts-accent); background: var(--tts-button); font-weight: 500; cursor: pointer; white-space: nowrap;
         }
-        .tool-button:hover:not([aria-disabled="true"]) { border-color: #94a3b8; background: #334155; }
-        .tool-button[aria-disabled="true"] { color: #64748b; cursor: default; opacity: .75; }
-        #tool-delivered { border-color: #15803d; color: #fff; background: #15803d; }
-        #tool-delivered:hover { border-color: #16a34a; background: #16a34a; }
-        #tool-refund-only { border-color: #2563eb; color: #fff; background: #2563eb; }
-        #tool-refund-only:hover { border-color: #3b82f6; background: #3b82f6; }
-        #tool-return-refund { border-color: #dc2626; color: #fff; background: #dc2626; }
-        #tool-return-refund:hover { border-color: #ef4444; background: #ef4444; }
-        #tool-log { border-color: #7c3aed; color: #fff; background: #7c3aed; }
-        #tool-log:hover { border-color: #8b5cf6; background: #8b5cf6; }
-        #tool-settings { border-color: #475569; color: #fff; background: #475569; }
-        #tool-settings:hover { background: #64748b; }
-        #tool-automation, #tool-automation:hover { border-color: #475569; color: #fff; background: #000000; }
-        #tool-automation.active, #tool-automation.active:hover { border-color: #f97316; background: #f97316; }
+        .tool-button:hover:not([aria-disabled="true"]):not(:disabled) { border-color: var(--tts-accent); background: var(--tts-button-hover); }
+        .tool-button[aria-disabled="true"] { cursor: default; opacity: .58; }
+        #tool-automation.active { box-shadow: inset 0 0 0 1px var(--tts-accent); }
+        #tool-automation.active::after {
+          content: ""; display: inline-block; width: 6px; height: 6px;
+          margin-left: 5px; border-radius: 50%; background: var(--tts-accent); vertical-align: middle;
+        }
         #overlay, #delivered-overlay, #refund-only-overlay, #log-overlay, #automation-overlay, #settings-overlay {
           display: none; position: fixed; inset: 0; z-index: 2147483647;
           align-items: center; justify-content: center; padding: 24px;
-          color: #111827; background: rgba(15,23,42,.5);
+          color: var(--tts-text); background: rgba(15,23,42,.45);
           font: 14px/1.5 system-ui, sans-serif;
         }
         #overlay.open, #delivered-overlay.open, #refund-only-overlay.open, #log-overlay.open, #automation-overlay.open, #settings-overlay.open { display: flex; }
         #panel, #delivered-panel, #refund-only-panel, #log-panel, #automation-panel, #settings-panel {
           width: min(760px, 100%); max-height: calc(100vh - 48px); overflow: auto;
-          border-radius: 14px; padding: 22px; background: #f8fafc;
+          border: 1px solid var(--tts-border); border-radius: 14px; padding: 22px; background: var(--tts-surface);
           box-shadow: 0 20px 60px rgba(0,0,0,.28);
         }
         .topbar {
@@ -3821,33 +3774,34 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #summary, #delivered-summary, #refund-only-summary, #log-summary { margin-top: 5px; }
         .toolbar { display: flex; gap: 8px; }
         .toolbar button, .send-refund {
-          border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 12px;
-          background: #fff; cursor: pointer;
+          border: 1px solid var(--tts-button-border); border-radius: 8px; padding: 8px 12px;
+          color: var(--tts-accent); background: var(--tts-button); cursor: pointer;
         }
+        .toolbar button:hover:not(:disabled), .send-refund:hover:not(:disabled) { border-color: var(--tts-accent); background: var(--tts-button-hover); }
         button:disabled { cursor: not-allowed; opacity: .58; }
         #orders, #delivered-orders, #refund-only-orders, #log-entries { display: grid; gap: 12px; margin-top: 18px; }
         .order-card {
           border: 1px solid #e2e8f0; border-radius: 10px; padding: 15px;
-          background: #fff;
+          background: var(--tts-card);
         }
         .log-card {
           border: 1px solid #e2e8f0; border-left-width: 4px; border-radius: 10px;
-          padding: 15px; background: #fff;
+          padding: 15px; background: var(--tts-card);
         }
-        .log-card.success { border-left-color: #16a34a; }
-        .log-card.failure { border-left-color: #dc2626; }
+        .log-card.success { border-left-color: #527768; }
+        .log-card.failure { border-left-color: #9f6060; }
         .log-badge {
           border-radius: 999px; padding: 2px 8px; font-size: 12px; white-space: nowrap;
         }
-        .log-badge.success { color: #166534; background: #dcfce7; }
-        .log-badge.failure { color: #991b1b; background: #fee2e2; }
+        .log-badge.success { color: #365b4d; background: #e8f0ec; }
+        .log-badge.failure { color: #884747; background: #f5eaea; }
         .order-heading { display: flex; justify-content: space-between; gap: 10px; }
         .badge {
-          border-radius: 999px; padding: 2px 8px; color: #9a3412; background: #ffedd5;
+          border-radius: 999px; padding: 2px 8px; color: #475569; background: #e2e8f0;
           font-size: 12px; white-space: nowrap;
         }
         .badge.manual { color: #475569; background: #e2e8f0; }
-        .badge.delivered { color: #166534; background: #dcfce7; }
+        .badge.delivered { color: #475569; background: #e2e8f0; }
         .details { display: grid; gap: 4px; margin-top: 11px; }
         .info-line { display: flex; justify-content: space-between; gap: 16px; }
         .info-line > :first-child { color: #64748b; }
@@ -3861,17 +3815,14 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         .row-result { flex: 1; color: #64748b; white-space: pre-wrap; }
         .row-result.ok { color: #166534; }
         .row-result.error { color: #991b1b; }
-        .send-refund { border-color: #dc2626; color: #fff; background: #dc2626; }
-        .delivered-reject { border-color: #15803d; background: #15803d; }
-        .refund-only-reject { border-color: #2563eb; background: #2563eb; }
         .empty { padding: 32px 12px; text-align: center; color: #64748b; }
         #status, #delivered-status, #refund-only-status, #log-file-state, #log-action-status, #automation-status {
           display: none; margin: 16px 0 0; border-radius: 8px; padding: 10px 12px;
           white-space: pre-wrap; overflow-wrap: anywhere; background: #f1f5f9;
         }
         #status.show, #delivered-status.show, #refund-only-status.show, #log-file-state.show, #log-action-status.show, #automation-status.show { display: block; }
-        #status.ok, #delivered-status.ok, #refund-only-status.ok, #log-file-state.ok, #log-action-status.ok, #automation-status.ok { color: #166534; background: #dcfce7; }
-        #status.error, #delivered-status.error, #refund-only-status.error, #log-file-state.error, #log-action-status.error { color: #991b1b; background: #fee2e2; }
+        #status.ok, #delivered-status.ok, #refund-only-status.ok, #log-file-state.ok, #log-action-status.ok, #automation-status.ok { color: #365b4d; background: #e8f0ec; }
+        #status.error, #delivered-status.error, #refund-only-status.error, #log-file-state.error, #log-action-status.error { color: #884747; background: #f5eaea; }
         .automation-form { display: grid; gap: 16px; margin-top: 18px; }
         .automation-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
         .automation-option { display: flex; align-items: center; gap: 8px; border: 1px solid #e2e8f0; border-radius: 9px; padding: 12px; background: #fff; cursor: pointer; }
@@ -3879,12 +3830,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         .automation-interval input { width: 130px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px; }
         .automation-interval input[type="datetime-local"] { width: 255px; font: inherit; }
         .automation-actions { display: flex; justify-content: flex-end; gap: 8px; }
-        #automation-enable { border-color: #ea580c; color: #fff; background: #ea580c; }
-        #automation-disable { border-color: #dc2626; color: #fff; background: #dc2626; }
         .shortcut { margin-top: 16px; color: #94a3b8; font-size: 12px; }
         .order-section { display: grid; gap: 12px; }
         .order-section h3 { margin: 4px 0; font-size: 15px; }
-        .review-section { margin-top: 18px; padding: 14px; border: 1px solid #fbbf24; border-radius: 10px; background: #fffbeb; }
+        .review-section { margin-top: 18px; padding: 14px; border: 1px solid var(--tts-border); border-radius: 10px; background: #f1f5f9; }
         .settings-form { display: grid; gap: 16px; margin-top: 18px; }
         .settings-form .toolbar { flex-wrap: wrap; align-items: center; }
         .settings-table { width: 100%; border-collapse: collapse; }
@@ -3911,7 +3860,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="delivered-title">已送达｜待核发退款</h2>
-              <p class="hint">仅显示 status_block 含“待核发退款”、fulfillment_block 的退货物流状态为“已送达”，且 button_block 中存在可用“回复”按钮的订单；仅有“接收退货包裹”的订单不处理。</p>
+              <p class="hint">仅显示状态块含“待核发退款”、退货物流状态为“已送达”，且按钮中存在可用“回复”按钮的订单。</p>
               <p id="delivered-summary"></p>
             </div>
             <div class="toolbar">
@@ -3929,7 +3878,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="title">退货退款｜待客户退货 · 10% 部分退款</h2>
-              <p class="hint">状态为“待客户退货”且 status_block 没有 content；按设置中的各站金额阈值分区，待处理区不参与一键及自动发送。</p>
+              <p class="hint">状态为“待客户退货”且没有状态字段；按不同站点金额阈值分区，待处理区不参与一键及自动发送。</p>
               <p id="summary"></p>
             </div>
             <div class="toolbar">
@@ -3948,7 +3897,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="refund-only-title">仅退款｜待核发退款</h2>
-              <p class="hint">自动分页读取“仅退款 + 待核发退款”；“平台处理”的缺失商品订单发送 10% 部分退款，其他已配置场景自动拒绝。</p>
+              <p class="hint">读取“仅退款 + 待核发退款”；“平台处理”的缺失商品订单发送 10% 部分退款。</p>
               <p id="refund-only-summary"></p>
             </div>
             <div class="toolbar">
@@ -3966,7 +3915,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="log-title">操作日志</h2>
-              <p class="hint">记录成功、失败和异常；界面最多显示最近 100 条。清空仅影响前端最近记录；持久副本每卷 1 MiB、最多 2 卷，继续轮转保留。</p>
+              <p class="hint">记录成功、失败和异常；界面最多显示最近 100 条。清空影响前端最近记录。</p>
               <p id="log-summary"></p>
             </div>
             <div class="toolbar">
@@ -3985,12 +3934,12 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="settings-title">设置｜站点金额与日志</h2>
-              <p class="hint">金额阈值按各站当地币种填写。留空不限制；等于阈值时可处理，超过时移入待处理区。</p>
+              <p class="hint">金额阈值留空不限制；大于阈值移入待处理区需手动处理。</p>
             </div>
             <div class="toolbar"><button id="settings-close" type="button">关闭</button></div>
           </div>
           <div class="settings-form">
-            <p class="hint">阈值比较商品原金额，同时应用于按钮3和按钮2的 10% 部分退款；按钮2的拒绝操作不受金额阈值影响。</p>
+            <p class="hint">阈值比较商品原金额，应用于仅退款和退货退款的 10% 部分退款；按钮2的拒绝操作不受金额阈值影响。</p>
             <table class="settings-table"><thead><tr><th>站点</th><th>币种与精度</th><th>金额阈值</th><th>导出日志</th></tr></thead><tbody id="settings-rows"></tbody></table>
             <div class="toolbar automation-actions"><span id="settings-feedback" role="status" aria-live="polite" hidden></span><button id="settings-save" type="button">保存设置</button><button id="settings-export" type="button">导出全量 CSV</button><button id="settings-export-normal" type="button">导出普通 CSV</button><label><input id="settings-select-all" type="checkbox">全选／全不选</label></div>
           </div>
@@ -4001,7 +3950,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="automation-title">自动运行设置</h2>
-              <p class="hint">从指定日期时间开始，按间隔运行所选功能；所有按钮合计一轮。总次数填 -1 表示不限次数，填正整数则达到次数后停止。</p>
+              <p class="hint">从指定时间开始，按间隔运行所选功能；所有按钮运行为合计一轮。总次数 -1 时表示不限次数，填正整数则达到次数后停止。</p>
             </div>
             <div class="toolbar">
               <button id="automation-close" type="button">关闭</button>
@@ -4028,7 +3977,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
               <input id="automation-max-runs" type="number" min="-1" max="100000" step="1" value="1">
               <span>轮（-1：不限次数；正整数：到次数停止）</span>
             </label>
-            <p class="hint">如首次 09:00、间隔 30 分钟、总次数 3：依次在 09:00、09:30、10:00 启动，第三轮结束后停止。耗时超过间隔时跳过重叠时间点。</p>
+            <p class="hint">如首次 09:00、间隔 30 分钟、总次数 3：依次在 09:00、09:30、10:00 启动，第三轮结束后停止。耗时超过间隔时跳过重叠时间点。
+            一次勾选的所有按钮合计一轮；刷新或切换站点后停止计划。
+            自动按钮：圆点和描边表示计划已启用（含等待运行），无标记表示已停止。停止后需要手动重新启用。
+            离线错过的任务恢复联网后合并补跑一次；两轮启动相隔不足5分钟则跳过并记日志，不计次数</p>
             <pre id="automation-status"></pre>
             <div class="automation-actions toolbar">
               <button id="automation-disable" type="button">取消自动运行</button>
