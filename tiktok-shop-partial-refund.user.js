@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.19.9
+// @version      0.19.10
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.19.9";
+  const APP_VERSION = "0.19.10";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -3715,19 +3715,19 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           all: initial;
           --tts-surface: #f8fafc;
           --tts-card: #fff;
-          --tts-text: #1e293b;
+          --tts-text: #111827;
           --tts-border: #cbd5e1;
-          --tts-button: #475569;
-          --tts-button-hover: #334155;
+          --tts-button: #fff;
+          --tts-focus: #475569;
         }
         *, *::before, *::after { box-sizing: border-box; }
         button { font: inherit; }
-        input { accent-color: var(--tts-button); }
+        input { accent-color: var(--tts-focus); }
         button:focus-visible, input:focus-visible {
-          outline: 2px solid var(--tts-button); outline-offset: 3px;
+          outline: 2px solid var(--tts-focus); outline-offset: 3px;
         }
         #launcher {
-          /* Launcher-only palette: dialog and action-button styles stay on 0.19.7. */
+          /* Launcher-only palette: dialog and action-button colors are independent. */
           --tts-launcher-surface: #111827;
           --tts-launcher-border: #334155;
           position: fixed; right: 24px; bottom: 24px; z-index: 2147483646;
@@ -3771,7 +3771,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #overlay, #delivered-overlay, #refund-only-overlay, #log-overlay, #automation-overlay, #settings-overlay {
           display: none; position: fixed; inset: 0; z-index: 2147483647;
           align-items: center; justify-content: center; padding: 24px;
-          color: var(--tts-text); background: rgba(15,23,42,.45);
+          color: var(--tts-text); background: rgba(15,23,42,.5);
           font: 14px/1.5 system-ui, sans-serif;
         }
         #overlay.open, #delivered-overlay.open, #refund-only-overlay.open, #log-overlay.open, #automation-overlay.open, #settings-overlay.open { display: flex; }
@@ -3789,10 +3789,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #summary, #delivered-summary, #refund-only-summary, #log-summary { margin-top: 5px; }
         .toolbar { display: flex; gap: 8px; }
         .toolbar button, .send-refund {
-          border: 1px solid var(--tts-button); border-radius: 8px; padding: 8px 12px;
-          color: #fff; background: var(--tts-button); cursor: pointer;
+          border: 1px solid var(--tts-border); border-radius: 8px; padding: 8px 12px;
+          color: var(--tts-text); background: var(--tts-button); cursor: pointer;
         }
-        .toolbar button:hover:not(:disabled), .send-refund:hover:not(:disabled) { border-color: var(--tts-button-hover); background: var(--tts-button-hover); }
+        .toolbar button:hover:not(:disabled) { border-color: #94a3b8; }
         button:disabled { cursor: not-allowed; opacity: .58; }
         #orders, #delivered-orders, #refund-only-orders, #log-entries { display: grid; gap: 12px; margin-top: 18px; }
         .order-card {
@@ -3803,20 +3803,20 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           border: 1px solid #e2e8f0; border-left-width: 4px; border-radius: 10px;
           padding: 15px; background: var(--tts-card);
         }
-        .log-card.success { border-left-color: #527768; }
-        .log-card.failure { border-left-color: #9f6060; }
+        .log-card.success { border-left-color: #16a34a; }
+        .log-card.failure { border-left-color: #dc2626; }
         .log-badge {
           border-radius: 999px; padding: 2px 8px; font-size: 12px; white-space: nowrap;
         }
-        .log-badge.success { color: #365b4d; background: #e8f0ec; }
-        .log-badge.failure { color: #884747; background: #f5eaea; }
+        .log-badge.success { color: #166534; background: #dcfce7; }
+        .log-badge.failure { color: #991b1b; background: #fee2e2; }
         .order-heading { display: flex; justify-content: space-between; gap: 10px; }
         .badge {
-          border-radius: 999px; padding: 2px 8px; color: #475569; background: #e2e8f0;
+          border-radius: 999px; padding: 2px 8px; color: #9a3412; background: #ffedd5;
           font-size: 12px; white-space: nowrap;
         }
         .badge.manual { color: #475569; background: #e2e8f0; }
-        .badge.delivered { color: #475569; background: #e2e8f0; }
+        .badge.delivered { color: #166534; background: #dcfce7; }
         .details { display: grid; gap: 4px; margin-top: 11px; }
         .info-line { display: flex; justify-content: space-between; gap: 16px; }
         .info-line > :first-child { color: #64748b; }
@@ -3830,14 +3830,17 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         .row-result { flex: 1; color: #64748b; white-space: pre-wrap; }
         .row-result.ok { color: #166534; }
         .row-result.error { color: #991b1b; }
+        .send-refund { border-color: #dc2626; color: #fff; background: #dc2626; }
+        .delivered-reject { border-color: #15803d; background: #15803d; }
+        .refund-only-reject { border-color: #2563eb; background: #2563eb; }
         .empty { padding: 32px 12px; text-align: center; color: #64748b; }
         #status, #delivered-status, #refund-only-status, #log-file-state, #log-action-status, #automation-status {
           display: none; margin: 16px 0 0; border-radius: 8px; padding: 10px 12px;
           white-space: pre-wrap; overflow-wrap: anywhere; background: #f1f5f9;
         }
         #status.show, #delivered-status.show, #refund-only-status.show, #log-file-state.show, #log-action-status.show, #automation-status.show { display: block; }
-        #status.ok, #delivered-status.ok, #refund-only-status.ok, #log-file-state.ok, #log-action-status.ok, #automation-status.ok { color: #365b4d; background: #e8f0ec; }
-        #status.error, #delivered-status.error, #refund-only-status.error, #log-file-state.error, #log-action-status.error { color: #884747; background: #f5eaea; }
+        #status.ok, #delivered-status.ok, #refund-only-status.ok, #log-file-state.ok, #log-action-status.ok, #automation-status.ok { color: #166534; background: #dcfce7; }
+        #status.error, #delivered-status.error, #refund-only-status.error, #log-file-state.error, #log-action-status.error { color: #991b1b; background: #fee2e2; }
         .automation-form { display: grid; gap: 16px; margin-top: 18px; }
         .automation-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
         .automation-option { display: flex; align-items: center; gap: 8px; border: 1px solid #e2e8f0; border-radius: 9px; padding: 12px; background: #fff; cursor: pointer; }
@@ -3845,10 +3848,12 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         .automation-interval input { width: 130px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px; }
         .automation-interval input[type="datetime-local"] { width: 255px; font: inherit; }
         .automation-actions { display: flex; justify-content: flex-end; gap: 8px; }
+        #automation-enable { border-color: #ea580c; color: #fff; background: #ea580c; }
+        #automation-disable { border-color: #dc2626; color: #fff; background: #dc2626; }
         .shortcut { margin-top: 16px; color: #94a3b8; font-size: 12px; }
         .order-section { display: grid; gap: 12px; }
         .order-section h3 { margin: 4px 0; font-size: 15px; }
-        .review-section { margin-top: 18px; padding: 14px; border: 1px solid var(--tts-border); border-radius: 10px; background: #f1f5f9; }
+        .review-section { margin-top: 18px; padding: 14px; border: 1px solid #fbbf24; border-radius: 10px; background: #fffbeb; }
         .settings-form { display: grid; gap: 16px; margin-top: 18px; }
         .settings-form .toolbar { flex-wrap: wrap; align-items: center; }
         .settings-table { width: 100%; border-collapse: collapse; }
