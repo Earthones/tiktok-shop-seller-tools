@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.19.8
+// @version      0.19.9
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.19.8";
+  const APP_VERSION = "0.19.9";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -3242,8 +3242,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     ui.automationDisable.disabled = !settings.enabled && !running;
     const active = settings.enabled && (!limit || running) && !automationState.cancelRequested;
     ui.automationTool?.classList.toggle("active", active);
+    ui.automationTool?.classList.toggle("running", running);
     ui.automationTool?.setAttribute("aria-pressed", String(active));
-    ui.automationTool?.setAttribute("title", `自动运行：${active ? "已启用" : "已停止"}；已启动 ${settings.startedRuns}/${settings.maxRuns > 0 ? settings.maxRuns : "不限"} 轮`);
+    ui.automationTool?.setAttribute("aria-busy", String(running));
+    ui.automationTool?.setAttribute("title", `自动运行：${stateText}；已启动 ${settings.startedRuns}/${settings.maxRuns > 0 ? settings.maxRuns : "不限"} 轮`);
   }
 
   function populateAutomationForm() {
@@ -3711,26 +3713,27 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       <style>
         :host {
           all: initial;
-          --tts-surface: #fff;
+          --tts-surface: #f8fafc;
           --tts-card: #fff;
           --tts-text: #1e293b;
-          --tts-border: #dbe7fb;
-          --tts-accent: #2563eb;
-          --tts-button-border: #3370ff;
-          --tts-button: #fff;
-          --tts-button-hover: #eff6ff;
+          --tts-border: #cbd5e1;
+          --tts-button: #475569;
+          --tts-button-hover: #334155;
         }
         *, *::before, *::after { box-sizing: border-box; }
         button { font: inherit; }
-        input { accent-color: var(--tts-accent); }
+        input { accent-color: var(--tts-button); }
         button:focus-visible, input:focus-visible {
-          outline: 2px solid var(--tts-accent); outline-offset: 3px;
+          outline: 2px solid var(--tts-button); outline-offset: 3px;
         }
         #launcher {
+          /* Launcher-only palette: dialog and action-button styles stay on 0.19.7. */
+          --tts-launcher-surface: #111827;
+          --tts-launcher-border: #334155;
           position: fixed; right: 24px; bottom: 24px; z-index: 2147483646;
-          width: 520px; max-width: calc(100vw - 16px); border: 1px solid var(--tts-border); border-radius: 13px;
-          padding: 8px; color: var(--tts-text); background: var(--tts-surface); touch-action: none;
-          box-shadow: 0 8px 24px rgba(30,64,175,.10);
+          width: 520px; max-width: calc(100vw - 16px); border: 1px solid var(--tts-launcher-border); border-radius: 13px;
+          padding: 8px; color: #fff; background: var(--tts-launcher-surface); touch-action: none;
+          box-shadow: 0 8px 24px rgba(15,23,42,.22);
           font: 14px/1.2 system-ui, sans-serif; user-select: none;
           transition: transform .22s ease, box-shadow .22s ease;
         }
@@ -3743,15 +3746,27 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #launcher.docked.peek { transform: translateX(0); }
         .tool-buttons { display: grid; grid-template-columns: repeat(6, 1fr); gap: 7px; }
         .tool-button {
-          border: 1px solid var(--tts-button-border); border-radius: 8px; padding: 9px 5px;
-          color: var(--tts-accent); background: var(--tts-button); font-weight: 500; cursor: pointer; white-space: nowrap;
+          --tts-launcher-button: #475569;
+          --tts-launcher-button-hover: #64748b;
+          border: 1px solid var(--tts-launcher-button); border-radius: 8px; padding: 9px 5px;
+          color: #fff; font-weight: 500; cursor: pointer; white-space: nowrap;
+          background: var(--tts-launcher-button);
         }
-        .tool-button:hover:not([aria-disabled="true"]):not(:disabled) { border-color: var(--tts-accent); background: var(--tts-button-hover); }
+        .tool-button:hover:not([aria-disabled="true"]):not(:disabled) {
+          border-color: var(--tts-launcher-button-hover);
+          background: var(--tts-launcher-button-hover);
+        }
+        .tool-button:focus-visible { outline-color: #bfdbfe; }
         .tool-button[aria-disabled="true"] { cursor: default; opacity: .58; }
-        #tool-automation.active { box-shadow: inset 0 0 0 1px var(--tts-accent); }
-        #tool-automation.active::after {
-          content: ""; display: inline-block; width: 6px; height: 6px;
-          margin-left: 5px; border-radius: 50%; background: var(--tts-accent); vertical-align: middle;
+        #tool-delivered { --tts-launcher-button: #15803d; --tts-launcher-button-hover: #16a34a; }
+        #tool-refund-only { --tts-launcher-button: #2563eb; --tts-launcher-button-hover: #3b82f6; }
+        #tool-return-refund { --tts-launcher-button: #dc2626; --tts-launcher-button-hover: #ef4444; }
+        #tool-log { --tts-launcher-button: #7c3aed; --tts-launcher-button-hover: #8b5cf6; }
+        #tool-settings { --tts-launcher-button: #475569; --tts-launcher-button-hover: #64748b; }
+        #tool-automation { --tts-launcher-button: #f97316; --tts-launcher-button-hover: #ea580c; position: relative; }
+        #tool-automation.running::after {
+          content: ""; position: absolute; top: 4px; right: 4px; width: 8px; height: 8px;
+          border-radius: 50%; background: #fff; pointer-events: none;
         }
         #overlay, #delivered-overlay, #refund-only-overlay, #log-overlay, #automation-overlay, #settings-overlay {
           display: none; position: fixed; inset: 0; z-index: 2147483647;
@@ -3774,10 +3789,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #summary, #delivered-summary, #refund-only-summary, #log-summary { margin-top: 5px; }
         .toolbar { display: flex; gap: 8px; }
         .toolbar button, .send-refund {
-          border: 1px solid var(--tts-button-border); border-radius: 8px; padding: 8px 12px;
-          color: var(--tts-accent); background: var(--tts-button); cursor: pointer;
+          border: 1px solid var(--tts-button); border-radius: 8px; padding: 8px 12px;
+          color: #fff; background: var(--tts-button); cursor: pointer;
         }
-        .toolbar button:hover:not(:disabled), .send-refund:hover:not(:disabled) { border-color: var(--tts-accent); background: var(--tts-button-hover); }
+        .toolbar button:hover:not(:disabled), .send-refund:hover:not(:disabled) { border-color: var(--tts-button-hover); background: var(--tts-button-hover); }
         button:disabled { cursor: not-allowed; opacity: .58; }
         #orders, #delivered-orders, #refund-only-orders, #log-entries { display: grid; gap: 12px; margin-top: 18px; }
         .order-card {
@@ -3979,7 +3994,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
             </label>
             <p class="hint">如首次 09:00、间隔 30 分钟、总次数 3：依次在 09:00、09:30、10:00 启动，第三轮结束后停止。耗时超过间隔时跳过重叠时间点。
             一次勾选的所有按钮合计一轮；刷新或切换站点后停止计划。
-            自动按钮：圆点和描边表示计划已启用（含等待运行），无标记表示已停止。停止后需要手动重新启用。
+            自动按钮固定橙色，右上角圆点表示正在执行；等待计划时间或已停止时不显示圆点。停止后需要手动重新启用。
             离线错过的任务恢复联网后合并补跑一次；两轮启动相隔不足5分钟则跳过并记日志，不计次数</p>
             <pre id="automation-status"></pre>
             <div class="automation-actions toolbar">
