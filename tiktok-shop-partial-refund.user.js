@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.19.10
+// @version      0.19.11
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.19.10";
+  const APP_VERSION = "0.19.11";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -1218,22 +1218,16 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     return orders;
   }
 
-  function hasDeliveredReplyButton(blocks) {
-    // Only an actual action button counts; status/help text mentioning 回复 does not.
-    // Missing/unknown button labels fail closed instead of guessing numeric action values.
-    return blocks.some((block) =>
-      block?.name === "button_block" &&
-      block.hidden !== true &&
-      Array.isArray(block.content) &&
-      block.content.some((item) => {
-        const button = item?.button;
-        const label = button?.text?.content;
-        return typeof label === "string" && label.trim() === "回复" &&
-          item.hidden !== true && item.disabled !== true &&
-          button.hidden !== true && button.disabled !== true &&
-          button.is_disabled !== true;
-      }),
-    );
+  function hasDeliveredRefundCountdown(statusBlock) {
+    // Match only the status content's displayed message items, not titles,
+    // message parameters or other blocks. Button labels may legitimately be null.
+    return Array.isArray(statusBlock?.content) && statusBlock.content.some((item) => {
+      const messages = item?.text?.dynamic_express?.items;
+      return Array.isArray(messages) && messages.some((message) =>
+        typeof message?.message_content === "string" &&
+        message.message_content.includes("时间剩余"),
+      );
+    });
   }
 
   function extractDeliveredOrders(responseData) {
@@ -1263,8 +1257,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         (text) => text === DELIVERED_FULFILLMENT_STATUS,
       );
 
-      const hasReplyButton = hasDeliveredReplyButton(blocks);
-      if (!isPendingRefund || !isDelivered || !hasReplyButton) continue;
+      const hasRefundCountdown = hasDeliveredRefundCountdown(statusBlock);
+      if (!isPendingRefund || !isDelivered || !hasRefundCountdown) continue;
 
       const mainOrderId = String(entry?.biz_data?.main_order_id || "").trim();
       const reverseMainOrderId = String(
@@ -1300,7 +1294,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         ...orderSiteFields(productPrice, context),
         status: DELIVERED_TARGET_STATUS,
         fulfillmentStatus: DELIVERED_FULFILLMENT_STATUS,
-        hasReplyButton,
+        hasRefundCountdown,
       });
     }
 
@@ -1808,7 +1802,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         `本次累计获取 ${pagination.allCards.length} 条（${pagination.pagesFetched} 页；${formatPaginationTrace(
           pagination.pageOffsets,
           pagination.pageSizes,
-        )}），共筛选出 ${deliveredState.orders.length} 条“待核发退款 + 已送达 + 有回复按钮”订单。`,
+        )}），共筛选出 ${deliveredState.orders.length} 条“待核发退款 + 已送达 + 状态内容含时间剩余”订单。`,
         "ok",
       );
       return deliveredState.orders;
@@ -2187,7 +2181,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       empty.className = "empty";
       empty.textContent = deliveredState.loading
         ? "正在读取已送达订单……"
-        : "当前没有同时满足“待核发退款 + 已送达 + 有回复按钮”的订单。";
+        : "当前没有同时满足“待核发退款 + 已送达 + 状态内容含时间剩余”的订单。";
       ui.deliveredOrders.append(empty);
       return;
     }
@@ -2561,8 +2555,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
     try {
       assertOrderContext(order);
-      if (order.hasReplyButton !== true) {
-        throw new Error("未确认订单具有回复按钮，已阻止拒绝请求，请刷新列表。");
+      if (order.hasRefundCountdown !== true) {
+        throw new Error("未确认订单状态内容含“时间剩余”，已阻止拒绝请求，请刷新列表。");
       }
       const outcome = await rejectDeliveredReturn(
         order.reverseMainOrderId,
@@ -2652,7 +2646,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
     if (!automated) {
       const confirmed = window.confirm(
-        `确认批量操作：\n\n即将依次拒绝 ${candidates.length} 条真实的退货退款申请。\n这些订单均为“待核发退款 + 已送达 + 有回复按钮”。\n拒绝原因统一为“此商品存在物理损坏”。\n已经成功的请求无法由脚本撤回。\n\n确定全部拒绝吗？`,
+        `确认批量操作：\n\n即将依次拒绝 ${candidates.length} 条真实的退货退款申请。\n这些订单均为“待核发退款 + 已送达 + 状态内容含时间剩余”。\n拒绝原因统一为“此商品存在物理损坏”。\n已经成功的请求无法由脚本撤回。\n\n确定全部拒绝吗？`,
       );
       if (!confirmed) return { type: "已送达", cancelled: true };
     }
@@ -3728,8 +3722,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         }
         #launcher {
           /* Launcher-only palette: dialog and action-button colors are independent. */
-          --tts-launcher-surface: #111827;
-          --tts-launcher-border: #334155;
+          --tts-launcher-surface: #ececec;
+          --tts-launcher-border: #e7e7e7;
           position: fixed; right: 24px; bottom: 24px; z-index: 2147483646;
           width: 520px; max-width: calc(100vw - 16px); border: 1px solid var(--tts-launcher-border); border-radius: 13px;
           padding: 8px; color: #fff; background: var(--tts-launcher-surface); touch-action: none;
@@ -3880,7 +3874,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="delivered-title">已送达｜待核发退款</h2>
-              <p class="hint">仅显示状态块含“待核发退款”、退货物流状态为“已送达”，且按钮中存在可用“回复”按钮的订单。</p>
+              <p class="hint">仅显示状态块含“待核发退款”、退货物流状态为“已送达”，且状态块 content 的文本消息中含“时间剩余”的订单；不再检查“回复”按钮文字。</p>
               <p id="delivered-summary"></p>
             </div>
             <div class="toolbar">
