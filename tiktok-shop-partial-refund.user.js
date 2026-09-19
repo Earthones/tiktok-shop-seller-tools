@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.20.0
+// @version      0.20.1
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.20.0";
+  const APP_VERSION = "0.20.1";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -24,6 +24,7 @@
   const DELIVERED_TARGET_STATUS = "待核发退款";
   const DELIVERED_FULFILLMENT_STATUS = "已送达";
   const LIST_API_PATH = "/reverse/component/orders/list";
+  const TOOLBOX_REQUEST_HEADER = "X-Tts-Seller-Tools-Request";
   const BOUND_REVERSE_PATHS = Object.freeze({
     ListReverseCards: "/reverse/component/orders/list",
     ActionPartialRefund: "/reverse/orders/actions/partial_refund",
@@ -169,8 +170,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   let siteContextRevision = 0;
   let pageSiteWatchTimer = null;
   const responseContexts = new WeakMap();
-  const boundSdkRequests = new Set();
-  const sdkTransportPromises = new WeakMap();
+  const boundSdkRequests = new Map();
+  const observedFetchFunctions = new WeakSet();
   let verifiedListRevision = -1;
   let verifiedFetch = null;
   let pageBindingConflict = false;
@@ -1009,55 +1010,31 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     }
   }
 
-  function assertBoundListData(result, context) {
+  function listCurrencyMatchesContext(result, context) {
     for (const entry of Array.isArray(result?.data?.cards) ? result.data.cards : []) {
       const blocks = Array.isArray(entry?.card?.blocks) ? entry.card.blocks : [];
       const price = getProductPriceText(blocks.find((block) => block?.name === "product_block"), entry?.biz_data);
       if (price && !siteForPrice(price, context)) {
-        throw siteRoutingError("返回订单的币种与本页绑定站点不一致，已停止处理；未提交退款或拒绝请求。");
+        return false;
       }
+    }
+    return true;
+  }
+
+  function assertBoundListData(result, context) {
+    if (!listCurrencyMatchesContext(result, context)) {
+      throw siteRoutingError("返回订单的币种与本页绑定站点不一致，已停止处理；未提交退款或拒绝请求。");
     }
   }
 
   function boundRequestKey(body) {
     if (!body || typeof body !== "object") return "";
-    if (body.reverse_main_order_id) return `order:${String(body.reverse_main_order_id)}`;
     const stable = (value) => Array.isArray(value) ? value.map(stable)
       : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])])) : value;
-    return JSON.stringify(stable({ offset: body.offset, count: body.count, search_condition: body.search_condition }));
+    return JSON.stringify(stable(body));
   }
 
-  async function discoverSdkTransport(rawApi, sdkUrl) {
-    const aliasNames = Object.entries(BOUND_REVERSE_PATHS).map(([method, path]) => {
-      const source = Function.prototype.toString.call(rawApi[method]);
-      if (!source.includes(path)) throw new Error("Reverse SDK 方法结构已变化");
-      return source.match(/\breturn\s+([\w$]+)\s*\(/)?.[1];
-    });
-    if (!aliasNames[0] || !aliasNames.every((alias) => alias === aliasNames[0])) {
-      throw new Error("无法识别 Reverse SDK 请求构造函数");
-    }
-    const response = await window.fetch(sdkUrl, { credentials: "omit", cache: "force-cache" });
-    if (!response.ok) throw new Error("无法读取当前 Reverse SDK 模块");
-    const source = await response.text();
-    const imports = source.matchAll(/\bimport\s*(?:[\w$]+\s*,\s*)?\{([^}]+)\}\s*from\s*["']([^"']+)["']/g);
-    for (const imported of imports) {
-      for (const specifier of imported[1].split(",")) {
-        const parts = specifier.trim().split(/\s+as\s+/);
-        if ((parts[1] || parts[0]) !== aliasNames[0] || !/^[\w$]+$/.test(parts[0])) continue;
-        const dependency = new URL(imported[2], sdkUrl);
-        if (dependency.origin !== new URL(sdkUrl).origin ||
-            !dependency.pathname.includes(REVERSE_CHUNK_MARKER) || !/\.js$/.test(dependency.pathname)) {
-          throw new Error("SDK 请求构造依赖不属于当前前端模块");
-        }
-        const module = await import(dependency.href);
-        if (typeof module[parts[0]] !== "function") throw new Error("SDK 请求构造导出不可用");
-        return module[parts[0]];
-      }
-    }
-    throw new Error("未找到当前 SDK 的请求构造导入");
-  }
-
-  function bindSdkApi(rawApi, sdkUrl) {
+  function guardSdkApi(rawApi) {
     const api = Object.create(rawApi);
     for (const [method, suffix] of Object.entries(BOUND_REVERSE_PATHS)) {
       api[method] = async (payload) => {
@@ -1068,13 +1045,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         if (!isList && (verifiedListRevision !== revision || verifiedFetch !== window.fetch)) {
           throw siteRoutingError("请先成功刷新本页订单列表，确认站点路由后再提交处理请求。");
         }
-        if (!sdkTransportPromises.has(rawApi)) {
-          sdkTransportPromises.set(rawApi, discoverSdkTransport(rawApi, sdkUrl).catch(() => {
-            sdkTransportPromises.delete(rawApi);
-            throw siteRoutingError("构造请求页面获取失败！无法确认当前 SDK 的请求构造方式，已停止自动计划。");
-          }));
-        }
-        const transport = await sdkTransportPromises.get(rawApi);
+        // SDK/security initialization may have wrapped fetch since document-start.
+        // A fresh read-only list may install our outer observer; writes may not
+        // silently trust a changed chain without another verified list first.
+        if (isList) installListFetchObserver();
         guard();
         const requestFetch = window.fetch;
         if (!isList && (verifiedListRevision !== revision || verifiedFetch !== requestFetch)) {
@@ -1083,23 +1057,24 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         const version = payload?.version || 1;
         if (!Number.isInteger(version) || version < 1 || version > 99) throw new Error("不支持的 Reverse API 版本");
         const path = `/api/v${version}${suffix}`;
-        const query = new URLSearchParams({ oec_seller_id: context.sellerId, seller_id: context.sellerId });
-        const region = availableSites().find((site) => site.id === context.siteId).region;
-        const ticket = { path, key: boundRequestKey(payload), context, guard, observed: false };
+        const requestId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+        const ticket = { path, key: boundRequestKey(payload), context, guard, fetch: requestFetch, observed: false, denied: false };
         if (isList) { verifiedListRevision = -1; verifiedFetch = null; }
-        boundSdkRequests.add(ticket);
+        boundSdkRequests.set(requestId, ticket);
         try {
-          // The generated SDK uses this same transport. Explicit URL query takes
-          // precedence over FerryFetch defaults BEFORE its serialization/security layer.
-          // Never copy cookies/signatures or rewrite an already signed request.
-          const result = await parseSdkResult(await transport(`${path}?${query}`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: payload, credentials: "include",
-          }, { domainRegion: region }));
+          // Use the original API method and its page-specific routing/signing.
+          // extraHeaders is a supported SDK option. Our fetch observer consumes
+          // this one-call marker locally; URL, payload and other headers are untouched.
+          const result = await parseSdkResult(await Reflect.apply(rawApi[method], rawApi, [
+            payload, { extraHeaders: { [TOOLBOX_REQUEST_HEADER]: requestId } },
+          ]));
           // An action already sent can complete after cancellation. Preserve its
           // actual result for the per-order success record; discard stale lists.
           if (isList) guard();
-          if (!ticket.observed) throw siteRoutingError("未能核验 SDK 发出的请求身份，已停止处理。请刷新本页后重试。");
+          // FerryFetch may translate a thrown observer error into code 1001.
+          // Keep our precise local cause instead of hiding it behind that code.
+          if (ticket.guardError) throw ticket.guardError;
+          if (!ticket.observed) throw siteRoutingError("未能核验本次 SDK 请求身份，已停止后续处理。请刷新本页列表后重试；已提交操作请先核对平台结果，勿直接重发。");
           if (result && typeof result === "object") responseContexts.set(result, context);
           if (isList && result?.code === 0) {
             if (requestFetch !== window.fetch) throw siteRoutingError("获取列表期间请求环境已变化，请重新刷新本页列表后再处理。");
@@ -1108,8 +1083,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
             verifiedFetch = requestFetch;
           }
           return result;
+        } catch (error) {
+          throw ticket.guardError || error;
         } finally {
-          boundSdkRequests.delete(ticket);
+          boundSdkRequests.delete(requestId);
         }
       };
     }
@@ -1145,7 +1122,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
             exportName,
             api,
           });
-          return { api: bindSdkApi(api, url), exportName, url };
+          return { api: guardSdkApi(api), exportName, url };
         }
       } catch (error) {
         failures.push({ url, error });
@@ -1671,7 +1648,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   function installListFetchObserver() {
     const originalFetch = window.fetch;
-    if (typeof originalFetch !== "function") return;
+    if (typeof originalFetch !== "function" || observedFetchFunctions.has(originalFetch)) return;
 
     window.fetch = async function sellerToolsFetchObserver(input, init) {
       const rawUrl = input instanceof Request ? input.url : String(input);
@@ -1680,35 +1657,54 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const method = String(init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
       let path = "";
       try { path = new URL(rawUrl, window.location.href).pathname; } catch {}
-      const pending = [...boundSdkRequests].filter((ticket) => ticket.path === path);
-      const inspectBoundBody = pending.length || (boundSdkRequests.size && method !== "GET" && method !== "HEAD");
-      const bodyPromise = isListRequest || inspectBoundBody
+      // Only an explicit one-call marker proves ownership. An ordinary page request
+      // can share the exact same endpoint and body and must remain independent.
+      const requestId = new Headers(headers).get(TOOLBOX_REQUEST_HEADER);
+      const ticket = requestId ? boundSdkRequests.get(requestId) : null;
+      if (requestId && !ticket) throw new Error("工具箱请求标记已失效，已阻止此旧请求。");
+      const bodyPromise = isListRequest || ticket
         ? readFetchBody(input, init)
         : Promise.resolve(null);
-      const requestBody = inspectBoundBody ? await bodyPromise : null;
-      const key = boundRequestKey(requestBody);
-      const ticket = pending.find((item) => item.key === key) ||
-        [...boundSdkRequests].find((item) => key && item.key === key);
-      if (ticket && (ticket.path !== path || method !== "POST")) {
-        throw siteRoutingError("SDK 请求的接口或方法与本页操作不一致，已阻止发送。");
-      }
-      if (pending.length && !ticket) {
-        throw siteRoutingError("SDK 请求体与本页待处理操作不一致，已阻止发送。");
-      }
       if (ticket) {
-        ticket.guard();
-        assertBoundRequest(rawUrl, headers, ticket.context);
-        ticket.observed = true;
+        try {
+          if (ticket.denied) throw ticket.guardError || new Error("本次工具箱请求已被阻止，不能继续重试。");
+          ticket.guard();
+          if (window.fetch !== ticket.fetch) throw siteRoutingError("本次 SDK 调用期间请求环境已变化，已阻止发送，请重新刷新列表。");
+          if (ticket.path !== path || method !== "POST") {
+            throw siteRoutingError("SDK 请求的接口或方法与本页操作不一致，已阻止发送。");
+          }
+          if (boundRequestKey(await bodyPromise) !== ticket.key) {
+            throw siteRoutingError("SDK 请求体与本页待处理操作不一致，已阻止发送。");
+          }
+          ticket.guard();
+          if (window.fetch !== ticket.fetch) throw siteRoutingError("本次 SDK 调用期间请求环境已变化，已阻止发送，请重新刷新列表。");
+          assertBoundRequest(rawUrl, headers, ticket.context);
+          ticket.observed = true;
+        } catch (error) {
+          ticket.denied = true;
+          ticket.guardError ||= error;
+          throw error;
+        }
       }
       const requestContext = ticket?.context || (isListRequest
         ? observeSiteContext(rawUrl, headers, { passive: true }) : null);
       const requestRevision = siteContextRevision;
       const belongsToPage = requestContext && !contextsConflict(requestContext, activeSiteContext);
       if (belongsToPage) latestListContext = requestContext;
-      const isToolboxListRequest = Boolean(ticket) || (isListRequest && state.internalListRequestDepth > 0);
+      const isToolboxListRequest = Boolean(ticket);
 
-      const response = await originalFetch.apply(this, arguments);
-      if (ticket && response.url) assertBoundRequest(response.url, headers, ticket.context, false);
+      let response;
+      if (ticket) {
+        const outgoingHeaders = new Headers(headers);
+        outgoingHeaders.delete(TOOLBOX_REQUEST_HEADER);
+        response = await originalFetch.call(this, input, { ...init, headers: outgoingHeaders });
+      } else {
+        response = await originalFetch.apply(this, arguments);
+      }
+      if (ticket && response.url) {
+        try { assertBoundRequest(response.url, headers, ticket.context, false); }
+        catch (error) { ticket.denied = true; ticket.guardError ||= error; throw error; }
+      }
 
       if (isListRequest) {
         Promise.all([bodyPromise, response.clone().json()])
@@ -1719,7 +1715,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
             if (!belongsToPage || requestRevision !== siteContextRevision) return;
             if (!isToolboxListRequest) {
               if (hasCompleteSiteContext(requestContext) && responseData?.code === 0) {
-                assertBoundListData(responseData, requestContext);
+                // Background page responses cannot stop an independent toolbox plan.
+                if (!listCurrencyMatchesContext(responseData, requestContext)) return;
               }
               if (isDeliveredListBody(requestBody)) {
                 if (!deliveredState.loading) {
@@ -1749,6 +1746,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
       return response;
     };
+    observedFetchFunctions.add(window.fetch);
   }
 
   installListFetchObserver();
