@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.19.11
+// @version      0.20.0
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
-// @description  Alt+T 显示或隐藏卖家工具箱功能条；通过 Reverse SDK 处理售后，刷新或切换站点后停止自动计划。
+// @description  Alt+T 显示或隐藏卖家工具箱；页级店铺绑定、计划状态指示、按时间导出 CSV，刷新或本页切站停止自动计划。
 // @match        https://seller.tiktokshopglobalselling.com/*
 // @match        https://seller-vn.tiktok.com/*
 // @run-at       document-start
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.19.11";
+  const APP_VERSION = "0.20.0";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -24,6 +24,12 @@
   const DELIVERED_TARGET_STATUS = "待核发退款";
   const DELIVERED_FULFILLMENT_STATUS = "已送达";
   const LIST_API_PATH = "/reverse/component/orders/list";
+  const BOUND_REVERSE_PATHS = Object.freeze({
+    ListReverseCards: "/reverse/component/orders/list",
+    ActionPartialRefund: "/reverse/orders/actions/partial_refund",
+    ActionReturnParcelReject: "/reverse/orders/actions/return_parcel_reject",
+    ActionReturnApplyReject: "/reverse/orders/actions/return_apply_reject",
+  });
   const KNOWN_SDK_URL =
     "https://lf-gs-frontend-cn.fanchenstatic.com/obj/she-op-static/i18n/ecom/mf_reverse_mpa/js/cwbqsafi.js";
   const REVERSE_CHUNK_MARKER = "/i18n/ecom/mf_reverse_mpa/js/";
@@ -140,10 +146,12 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     timer: null,
     running: false,
     networkInterrupted: false,
+    recovering: false,
     acquiringLock: false,
     runningPlanId: "",
     lockHeartbeat: null,
     cancelRequested: false,
+    stoppedPlanIds: new Set(),
     instanceId:
       globalThis.crypto?.randomUUID?.() ||
       `${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -154,11 +162,18 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   let siteSettings = loadSiteSettings();
   let activeSiteContext = contextFromUrl(window.location.href);
   let pageSiteSignals = readPageSiteSignals();
-  if (pageSiteSignals.sellerCookie) activeSiteContext.sellerId = pageSiteSignals.sellerCookie;
+  if (hasCompleteSiteContext(pageSiteSignals.injected) && !contextsConflict(activeSiteContext, pageSiteSignals.injected)) {
+    activeSiteContext = { ...pageSiteSignals.injected };
+  }
   let latestListContext = activeSiteContext;
   let siteContextRevision = 0;
   let pageSiteWatchTimer = null;
   const responseContexts = new WeakMap();
+  const boundSdkRequests = new Set();
+  const sdkTransportPromises = new WeakMap();
+  let verifiedListRevision = -1;
+  let verifiedFetch = null;
+  let pageBindingConflict = false;
 
   function availableSites() {
     const prefix = window.location.hostname === "seller-vn.tiktok.com" ? "local_" : "global_";
@@ -184,6 +199,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       exportSites: Array.isArray(saved?.exportSites)
         ? saved.exportSites.filter((id) => availableSites().some((site) => site.id === id))
         : availableSites().map((site) => site.id),
+      exportStart: {
+        date: typeof saved?.exportStart?.date === "string" ? saved.exportStart.date : "",
+        time: typeof saved?.exportStart?.time === "string" ? saved.exportStart.time : "",
+      },
     };
   }
 
@@ -236,8 +255,29 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     };
   }
 
-  function observeSiteContext(rawUrl, headers) {
+  function contextsConflict(left, right) {
+    return Boolean(
+      (left.sellerId && right.sellerId && left.sellerId !== right.sellerId) ||
+      (left.siteId !== "unknown" && right.siteId !== "unknown" && left.siteId !== right.siteId),
+    );
+  }
+
+  function hasCompleteSiteContext(context) {
+    return Boolean(context.sellerId && availableSites().some((site) => site.id === context.siteId));
+  }
+
+  function describePageBinding() {
+    const site = availableSites().find((item) => item.id === activeSiteContext.siteId);
+    return hasCompleteSiteContext(activeSiteContext)
+      ? `${site.label} · 店铺尾号 ${activeSiteContext.sellerId.slice(-4)}`
+      : "未识别，请先打开本页目标站点的订单列表";
+  }
+
+  function observeSiteContext(rawUrl, headers, { passive = false } = {}) {
     const observed = contextFromUrl(rawUrl, headers);
+    // A page's background request can inherit changed shared state. It cannot
+    // silently rebind this tab. Local URL/base-info changes are handled separately.
+    if (passive && contextsConflict(activeSiteContext, observed)) return observed;
     const sellerChanged = Boolean(observed.sellerId && activeSiteContext.sellerId && observed.sellerId !== activeSiteContext.sellerId);
     const next = {
       ...observed,
@@ -247,6 +287,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     const regionChanged = next.siteId !== "unknown" && activeSiteContext.siteId !== "unknown" && next.siteId !== activeSiteContext.siteId;
     if (sellerChanged || regionChanged) {
       siteContextRevision += 1;
+      verifiedListRevision = -1;
+      verifiedFetch = null;
       stopAutomation({ node: "切换站点停止", reason: "检测到站点或店铺切换，原自动计划已停止，请在目标站点手动重新启用。" });
       sdkPromise = undefined;
       state.eligibleOrders = [];
@@ -261,30 +303,53 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     return { ...next };
   }
 
-  function readPageSiteSignals() {
-    // 仅读取当前店铺标识，不读取/保存登录令牌。主站切换国家有时只更新这个 Cookie。
-    let sellerCookie = "";
+  function readInjectedSiteContext() {
+    const empty = { siteId: "unknown", sellerId: "", sourceHost: window.location.hostname };
     try {
-      sellerCookie = document.cookie.match(/(?:^|;\s*)oec_seller_id_unified_seller_env=(\d+)(?:;|$)/)?.[1] || "";
-    } catch {}
-    return { ...contextFromUrl(window.location.href), sellerCookie };
+      const text = document.getElementById("atlas_inject_workbench-base-info")?.textContent;
+      if (!text) return empty;
+      // Preserve 64-bit identifiers; never round a seller ID through Number.
+      const safeText = text.replace(/("(?:\\.|[^"\\])*")|(-?\d{16,})(?=\s*[,}\]])/g,
+        (match, quoted, integer) => quoted || `"${integer}"`);
+      const seller = JSON.parse(safeText)?.seller_base_info?.seller;
+      const sellerId = typeof seller?.seller_id === "string" ? seller.seller_id : "";
+      const region = String(seller?.shop_region || "").toUpperCase();
+      const site = availableSites().find((item) => item.region === region);
+      return { ...empty, sellerId, siteId: site?.id || "unknown" };
+    } catch { return empty; }
+  }
+
+  function readPageSiteSignals() {
+    // These signals belong to this document; shared cookies are never a tab identity.
+    return { ...contextFromUrl(window.location.href), injected: readInjectedSiteContext() };
   }
 
   function checkPageSiteContext() {
     const previous = pageSiteSignals;
     const current = readPageSiteSignals();
     pageSiteSignals = current;
+    if (hasCompleteSiteContext(current.injected) && contextsConflict(current, current.injected)) {
+      if (!pageBindingConflict) {
+        pageBindingConflict = true;
+        siteContextRevision += 1;
+        verifiedListRevision = -1;
+        verifiedFetch = null;
+        stopAutomation({ node: "本页站点冲突停止", reason: "本页地址与页面店铺信息不一致，已停止计划并阻止请求，请核对本页站点后刷新。" });
+      }
+      return;
+    }
+    const conflictResolved = pageBindingConflict;
+    pageBindingConflict = false;
     if ((current.siteId !== "unknown" && current.siteId !== previous.siteId) ||
-        (current.sellerId && current.sellerId !== previous.sellerId)) {
+        (current.sellerId && current.sellerId !== previous.sellerId) || conflictResolved) {
       observeSiteContext(window.location.href);
     }
-    if (current.sellerCookie && current.sellerCookie !== previous.sellerCookie) {
+    if (hasCompleteSiteContext(current.injected) &&
+        (!hasCompleteSiteContext(previous.injected) || contextsConflict(current.injected, previous.injected) || conflictResolved)) {
       const url = new URL(window.location.href);
-      url.searchParams.set("oec_seller_id", current.sellerCookie);
+      url.searchParams.set("oec_seller_id", current.injected.sellerId);
+      url.searchParams.set("shop_region", availableSites().find((site) => site.id === current.injected.siteId).region);
       observeSiteContext(url.href);
-    } else if (previous.sellerCookie && !current.sellerCookie) {
-      siteContextRevision += 1;
-      stopAutomation({ node: "店铺状态变化停止", reason: "当前店铺标识已失效，自动计划已停止，请确认登录和站点后重新启用。" });
     }
   }
 
@@ -308,10 +373,12 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   function createRequestGuard() {
     checkPageSiteContext();
+    if (pageBindingConflict) throw new Error("本页地址与页面店铺信息不一致，已阻止发送请求，请核对站点后刷新。");
     const revision = siteContextRevision;
     const automaticPlanId = automationState.running ? automationState.runningPlanId : "";
     return () => {
       checkPageSiteContext();
+      if (pageBindingConflict) throw new Error("本页地址与页面店铺信息不一致，已阻止发送请求，请核对站点后刷新。");
       if (revision !== siteContextRevision) throw new Error("站点或店铺已切换，已阻止继续发送旧操作。");
       if (automaticPlanId && (automationState.runningPlanId !== automaticPlanId || !automationShouldContinue())) {
         throw new Error("自动计划已停止，已阻止继续发送请求。");
@@ -321,6 +388,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   function assertOrderContext(order) {
     checkPageSiteContext();
+    if (pageBindingConflict) throw new Error("本页地址与页面店铺信息不一致，请核对站点后刷新列表。");
     if (order.sellerId && activeSiteContext.sellerId && order.sellerId !== activeSiteContext.sellerId) {
       throw new Error("当前店铺已切换，请刷新订单列表后再处理。");
     }
@@ -687,6 +755,30 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
   }
 
+  function parseExportStart(value, now = Date.now()) {
+    const dateText = String(value?.date || "").trim();
+    const timeText = String(value?.time || "").trim();
+    if (!dateText && !timeText) return { date: "", time: "", timestamp: null };
+    if (!dateText || !timeText) throw new Error("请同时填写导出起始日期和时间；全部留空则导出所有保留日志。");
+    const dateParts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText);
+    const timeParts = /^(\d{2})([.:])(\d{2})\2(\d{2})$/.exec(timeText);
+    if (!dateParts || !timeParts) throw new Error("导出时间请使用 24 小时制 HH.mm.ss 或 HH:mm:ss，例如 19.50.20。");
+    const [, yearText, monthText, dayText] = dateParts;
+    const year = Number(yearText), month = Number(monthText), day = Number(dayText);
+    const hour = Number(timeParts[1]), minute = Number(timeParts[3]), second = Number(timeParts[4]);
+    if (year < 1000 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+      throw new Error("导出起始日期或时间无效，请检查日期和时分秒。");
+    }
+    // Construct and compare local components: invalid calendar dates and DST gaps fail closed.
+    const date = new Date(year, month - 1, day, hour, minute, second, 0);
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day ||
+        date.getHours() !== hour || date.getMinutes() !== minute || date.getSeconds() !== second) {
+      throw new Error("导出起始日期或时间无效，请检查日期和当前时区。");
+    }
+    if (date.getTime() > now) throw new Error("导出起始时间不能晚于当前时间。");
+    return { date: dateText, time: `${timeParts[1]}.${timeParts[3]}.${timeParts[4]}`, timestamp: date.getTime() };
+  }
+
   function isPackageOperationLog(entry) {
     const hasId = [entry.mainOrderId, entry.reverseMainOrderId].some((value) =>
       value != null && !["", "—", "-"].includes(String(value).trim()),
@@ -704,7 +796,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     return `"${text.replace(/"/g, '""')}"`;
   }
 
-  function groupLogFiles(entries, selectedSites, mode = "full") {
+  function groupLogFiles(entries, selectedSites, mode = "full", range = null) {
     if (!["full", "normal"].includes(mode)) throw new Error("未知日志导出类型。");
     const selected = new Set(selectedSites);
     if (!selected.size) return [];
@@ -714,13 +806,18 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     const modeLabel = mode === "normal" ? "普通日志" : "全量日志";
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") continue;
+      if (range) {
+        const timestamp = Date.parse(entry.timestamp);
+        if (range.startAt != null && (!Number.isFinite(timestamp) || timestamp < range.startAt)) continue;
+        if (Number.isFinite(timestamp) && timestamp > range.endAt) continue;
+      }
       const site = SITES.find((item) => item.id === entry.siteId);
       const siteId = site?.id || "unknown";
       // Full export also retains unassigned diagnostics, without adding an unknown-site UI option.
       if (!selected.has(siteId) && !(mode === "full" && siteId === "unknown")) continue;
       if (mode === "normal" && !isPackageOperationLog(entry)) continue;
       const category = logCategory(entry);
-      const filename = `${siteId}_${site?.label.replace(/ · /g, "_") || "未归属站点"}_${modeLabel}.csv`;
+      const filename = `${site?.label.replace(/ · /g, "_") || "未归属站点"}_${modeLabel}.csv`;
       if (!groups.has(filename)) groups.set(filename, []);
       groups.get(filename).push({
         "时间": formatExportTime(entry.timestamp),
@@ -744,6 +841,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   async function exportPersistentLogs(options = {}) {
+    // Freeze the click-time boundary before waiting for IndexedDB or queued writes.
+    const exportedAt = options.exportedAt ?? Date.now();
+    if (!Number.isFinite(exportedAt)) throw new Error("导出结束时间无效。");
+    const start = parseExportStart(options.exportStart ?? siteSettings.exportStart, exportedAt);
     const mode = options.mode ?? "full";
     const segments = await readPersistentLogSegments();
     const entries = [], seen = new Set();
@@ -764,9 +865,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     entries.sort(compareLogsNewestFirst);
     const files = groupLogFiles(
       entries, options.siteIds || siteSettings.exportSites, mode,
+      { startAt: start.timestamp, endAt: exportedAt },
     );
-    if (!files.length) throw new Error("勾选的站点没有可导出的日志；无法识别站点的旧记录仍保留在持久日志副本中。");
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    if (!files.length) throw new Error("勾选站点在所选时间范围内没有可导出的日志；已轮转清除的记录无法恢复。");
+    const stamp = formatExportTime(exportedAt).replace(" ", "T").replace(/:/g, "-");
     for (const file of files) {
       const blob = new Blob([file.content], { type: "text/csv;charset=utf-8" });
       downloadBlob(blob, file.name.replace(/\.csv$/, `_${stamp}.csv`));
@@ -874,6 +976,146 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     );
   }
 
+  function siteRoutingError(message) {
+    verifiedListRevision = -1;
+    verifiedFetch = null;
+    stopAutomation({ node: "请求站点校验停止", reason: message });
+    return new Error(message);
+  }
+
+  function requirePageBinding() {
+    checkPageSiteContext();
+    if (pageBindingConflict) throw siteRoutingError("本页地址与页面店铺信息不一致，已阻止发送请求，请核对站点后刷新。");
+    if (!hasCompleteSiteContext(activeSiteContext)) {
+      throw siteRoutingError("尚未识别本页店铺和地区，请先在此标签页打开目标站点的退货订单列表，再启用工具箱。");
+    }
+    return { ...activeSiteContext };
+  }
+
+  function assertBoundRequest(rawUrl, headers, context, checkRegion = true) {
+    const url = new URL(rawUrl, window.location.href);
+    const validHost = context.sourceHost === "seller-vn.tiktok.com"
+      ? url.hostname === "seller-vn.tiktok.com"
+      : url.hostname.endsWith(".tiktokshopglobalselling.com");
+    const site = availableSites().find((item) => item.id === context.siteId);
+    const idsMatch = ["seller_id", "oec_seller_id"].every((key) => {
+      const values = url.searchParams.getAll(key);
+      return values.length === 1 && values[0] === context.sellerId;
+    });
+    const region = new Headers(headers).get("x-tt-oec-region");
+    if (url.protocol !== "https:" || !validHost || !idsMatch ||
+        (checkRegion && region?.toUpperCase() !== site?.region)) {
+      throw siteRoutingError("请求的店铺或地区与本页绑定不一致，已阻止继续发送。请核对本页站点后刷新列表。");
+    }
+  }
+
+  function assertBoundListData(result, context) {
+    for (const entry of Array.isArray(result?.data?.cards) ? result.data.cards : []) {
+      const blocks = Array.isArray(entry?.card?.blocks) ? entry.card.blocks : [];
+      const price = getProductPriceText(blocks.find((block) => block?.name === "product_block"), entry?.biz_data);
+      if (price && !siteForPrice(price, context)) {
+        throw siteRoutingError("返回订单的币种与本页绑定站点不一致，已停止处理；未提交退款或拒绝请求。");
+      }
+    }
+  }
+
+  function boundRequestKey(body) {
+    if (!body || typeof body !== "object") return "";
+    if (body.reverse_main_order_id) return `order:${String(body.reverse_main_order_id)}`;
+    const stable = (value) => Array.isArray(value) ? value.map(stable)
+      : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])])) : value;
+    return JSON.stringify(stable({ offset: body.offset, count: body.count, search_condition: body.search_condition }));
+  }
+
+  async function discoverSdkTransport(rawApi, sdkUrl) {
+    const aliasNames = Object.entries(BOUND_REVERSE_PATHS).map(([method, path]) => {
+      const source = Function.prototype.toString.call(rawApi[method]);
+      if (!source.includes(path)) throw new Error("Reverse SDK 方法结构已变化");
+      return source.match(/\breturn\s+([\w$]+)\s*\(/)?.[1];
+    });
+    if (!aliasNames[0] || !aliasNames.every((alias) => alias === aliasNames[0])) {
+      throw new Error("无法识别 Reverse SDK 请求构造函数");
+    }
+    const response = await window.fetch(sdkUrl, { credentials: "omit", cache: "force-cache" });
+    if (!response.ok) throw new Error("无法读取当前 Reverse SDK 模块");
+    const source = await response.text();
+    const imports = source.matchAll(/\bimport\s*(?:[\w$]+\s*,\s*)?\{([^}]+)\}\s*from\s*["']([^"']+)["']/g);
+    for (const imported of imports) {
+      for (const specifier of imported[1].split(",")) {
+        const parts = specifier.trim().split(/\s+as\s+/);
+        if ((parts[1] || parts[0]) !== aliasNames[0] || !/^[\w$]+$/.test(parts[0])) continue;
+        const dependency = new URL(imported[2], sdkUrl);
+        if (dependency.origin !== new URL(sdkUrl).origin ||
+            !dependency.pathname.includes(REVERSE_CHUNK_MARKER) || !/\.js$/.test(dependency.pathname)) {
+          throw new Error("SDK 请求构造依赖不属于当前前端模块");
+        }
+        const module = await import(dependency.href);
+        if (typeof module[parts[0]] !== "function") throw new Error("SDK 请求构造导出不可用");
+        return module[parts[0]];
+      }
+    }
+    throw new Error("未找到当前 SDK 的请求构造导入");
+  }
+
+  function bindSdkApi(rawApi, sdkUrl) {
+    const api = Object.create(rawApi);
+    for (const [method, suffix] of Object.entries(BOUND_REVERSE_PATHS)) {
+      api[method] = async (payload) => {
+        const context = requirePageBinding();
+        const guard = createRequestGuard();
+        const revision = siteContextRevision;
+        const isList = method === "ListReverseCards";
+        if (!isList && (verifiedListRevision !== revision || verifiedFetch !== window.fetch)) {
+          throw siteRoutingError("请先成功刷新本页订单列表，确认站点路由后再提交处理请求。");
+        }
+        if (!sdkTransportPromises.has(rawApi)) {
+          sdkTransportPromises.set(rawApi, discoverSdkTransport(rawApi, sdkUrl).catch(() => {
+            sdkTransportPromises.delete(rawApi);
+            throw siteRoutingError("构造请求页面获取失败！无法确认当前 SDK 的请求构造方式，已停止自动计划。");
+          }));
+        }
+        const transport = await sdkTransportPromises.get(rawApi);
+        guard();
+        const requestFetch = window.fetch;
+        if (!isList && (verifiedListRevision !== revision || verifiedFetch !== requestFetch)) {
+          throw siteRoutingError("请求环境已变化，请重新刷新本页订单列表后再提交处理请求。");
+        }
+        const version = payload?.version || 1;
+        if (!Number.isInteger(version) || version < 1 || version > 99) throw new Error("不支持的 Reverse API 版本");
+        const path = `/api/v${version}${suffix}`;
+        const query = new URLSearchParams({ oec_seller_id: context.sellerId, seller_id: context.sellerId });
+        const region = availableSites().find((site) => site.id === context.siteId).region;
+        const ticket = { path, key: boundRequestKey(payload), context, guard, observed: false };
+        if (isList) { verifiedListRevision = -1; verifiedFetch = null; }
+        boundSdkRequests.add(ticket);
+        try {
+          // The generated SDK uses this same transport. Explicit URL query takes
+          // precedence over FerryFetch defaults BEFORE its serialization/security layer.
+          // Never copy cookies/signatures or rewrite an already signed request.
+          const result = await parseSdkResult(await transport(`${path}?${query}`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: payload, credentials: "include",
+          }, { domainRegion: region }));
+          // An action already sent can complete after cancellation. Preserve its
+          // actual result for the per-order success record; discard stale lists.
+          if (isList) guard();
+          if (!ticket.observed) throw siteRoutingError("未能核验 SDK 发出的请求身份，已停止处理。请刷新本页后重试。");
+          if (result && typeof result === "object") responseContexts.set(result, context);
+          if (isList && result?.code === 0) {
+            if (requestFetch !== window.fetch) throw siteRoutingError("获取列表期间请求环境已变化，请重新刷新本页列表后再处理。");
+            assertBoundListData(result, context);
+            verifiedListRevision = revision;
+            verifiedFetch = requestFetch;
+          }
+          return result;
+        } finally {
+          boundSdkRequests.delete(ticket);
+        }
+      };
+    }
+    return api;
+  }
+
   function getSdkCandidates() {
     const loadedChunks = performance
       .getEntriesByType("resource")
@@ -903,7 +1145,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
             exportName,
             api,
           });
-          return { api, exportName, url };
+          return { api: bindSdkApi(api, url), exportName, url };
         }
       } catch (error) {
         failures.push({ url, error });
@@ -1434,23 +1676,51 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     window.fetch = async function sellerToolsFetchObserver(input, init) {
       const rawUrl = input instanceof Request ? input.url : String(input);
       const isListRequest = rawUrl.includes(LIST_API_PATH);
-      const requestContext = isListRequest
-        ? observeSiteContext(rawUrl, init?.headers ?? (input instanceof Request ? input.headers : undefined))
-        : null;
-      if (requestContext) latestListContext = requestContext;
-      const isToolboxListRequest =
-        isListRequest && state.internalListRequestDepth > 0;
-      const bodyPromise = isListRequest
+      const headers = init?.headers ?? (input instanceof Request ? input.headers : undefined);
+      const method = String(init?.method || (input instanceof Request ? input.method : "GET")).toUpperCase();
+      let path = "";
+      try { path = new URL(rawUrl, window.location.href).pathname; } catch {}
+      const pending = [...boundSdkRequests].filter((ticket) => ticket.path === path);
+      const inspectBoundBody = pending.length || (boundSdkRequests.size && method !== "GET" && method !== "HEAD");
+      const bodyPromise = isListRequest || inspectBoundBody
         ? readFetchBody(input, init)
         : Promise.resolve(null);
+      const requestBody = inspectBoundBody ? await bodyPromise : null;
+      const key = boundRequestKey(requestBody);
+      const ticket = pending.find((item) => item.key === key) ||
+        [...boundSdkRequests].find((item) => key && item.key === key);
+      if (ticket && (ticket.path !== path || method !== "POST")) {
+        throw siteRoutingError("SDK 请求的接口或方法与本页操作不一致，已阻止发送。");
+      }
+      if (pending.length && !ticket) {
+        throw siteRoutingError("SDK 请求体与本页待处理操作不一致，已阻止发送。");
+      }
+      if (ticket) {
+        ticket.guard();
+        assertBoundRequest(rawUrl, headers, ticket.context);
+        ticket.observed = true;
+      }
+      const requestContext = ticket?.context || (isListRequest
+        ? observeSiteContext(rawUrl, headers, { passive: true }) : null);
+      const requestRevision = siteContextRevision;
+      const belongsToPage = requestContext && !contextsConflict(requestContext, activeSiteContext);
+      if (belongsToPage) latestListContext = requestContext;
+      const isToolboxListRequest = Boolean(ticket) || (isListRequest && state.internalListRequestDepth > 0);
 
       const response = await originalFetch.apply(this, arguments);
+      if (ticket && response.url) assertBoundRequest(response.url, headers, ticket.context, false);
 
       if (isListRequest) {
         Promise.all([bodyPromise, response.clone().json()])
           .then(([requestBody, responseData]) => {
             responseContexts.set(responseData, requestContext);
+            // Ignore foreign/stale background responses; never relabel their
+            // orders as this tab's bound shop or replace the active list with them.
+            if (!belongsToPage || requestRevision !== siteContextRevision) return;
             if (!isToolboxListRequest) {
+              if (hasCompleteSiteContext(requestContext) && responseData?.code === 0) {
+                assertBoundListData(responseData, requestContext);
+              }
               if (isDeliveredListBody(requestBody)) {
                 if (!deliveredState.loading) {
                   handleDeliveredListResponse(
@@ -3132,7 +3402,15 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const saved = ALLOW_MULTI_TAB_AUTOMATION
         ? sessionStorage.getItem(AUTOMATION_SETTINGS_STORAGE_KEY) ?? localStorage.getItem(AUTOMATION_SETTINGS_STORAGE_KEY)
         : localStorage.getItem(AUTOMATION_SETTINGS_STORAGE_KEY);
-      return sanitizeAutomationSettings(JSON.parse(saved || "null"));
+      const settings = sanitizeAutomationSettings(JSON.parse(saved || "null"));
+      // A failed stop write must never revive a stale enabled record in this tab.
+      // This function is first called after automationState has been initialized.
+      if (automationState.stoppedPlanIds.has(settings.planId)) {
+        settings.enabled = false;
+        settings.nextRunAt = "";
+        settings.missedRunAt = "";
+      }
+      return settings;
     } catch { return getDefaultAutomationSettings(); }
   }
 
@@ -3214,11 +3492,25 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     const labels = getSelectedAutomationLabels(settings);
     const limit = automationLimitReached(settings);
     const running = automationState.running;
-    const stateText = running
-      ? (automationState.cancelRequested ? "停止中，等待当前请求结束" : `正在运行第 ${settings.startedRuns} 轮`)
-      : limit ? "已达到总运行次数" : settings.enabled ? "已启用，等待计划时间" : "已停止";
+    const active = settings.enabled && (!limit || running) && !automationState.cancelRequested;
+    // The plan indicator covers waiting as well as executing. An old interruption
+    // must not make an online, otherwise idle plan look permanently offline.
+    const offline = active && navigator.onLine === false;
+    const recovering = active && !offline && (
+      Boolean(settings.missedRunAt) || automationState.recovering ||
+      (running && automationState.networkInterrupted)
+    );
+    const stateText = automationState.cancelRequested && running
+      ? "停止中，等待当前请求结束"
+      : offline ? "已断网，等待恢复网络"
+      : recovering ? (running ? `已联网，正在恢复处理第 ${settings.startedRuns} 轮` : "已联网，等待恢复补跑")
+      : running ? `正在运行第 ${settings.startedRuns} 轮`
+      : limit ? "已达到总运行次数"
+      : active ? (settings.startedRuns ? "已启用，等待下一轮" : "已启用，等待首次运行")
+      : "已停止";
     ui.automationStatus.textContent = [
       `当前状态：${stateText}`,
+      `绑定站点：${describePageBinding()}`,
       `已选功能：${labels.join("、") || "无"}`,
       `首次运行：${formatAutomationTime(settings.firstRunAt)}`,
       `时间显示按浏览器时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
@@ -3234,12 +3526,20 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     ui.automationStatus.className = `show ${settings.enabled ? "ok" : ""}`;
     ui.automationEnable.disabled = running;
     ui.automationDisable.disabled = !settings.enabled && !running;
-    const active = settings.enabled && (!limit || running) && !automationState.cancelRequested;
     ui.automationTool?.classList.toggle("active", active);
     ui.automationTool?.classList.toggle("running", running);
     ui.automationTool?.setAttribute("aria-pressed", String(active));
     ui.automationTool?.setAttribute("aria-busy", String(running));
     ui.automationTool?.setAttribute("title", `自动运行：${stateText}；已启动 ${settings.startedRuns}/${settings.maxRuns > 0 ? settings.maxRuns : "不限"} 轮`);
+    if (ui.automationBadge) {
+      ui.automationBadge.hidden = !active;
+      ui.automationBadge.dataset.state = offline ? "offline" : recovering ? "recovering" : "enabled";
+      const badgeStatus = `${stateText}；已启动 ${settings.startedRuns}/${settings.maxRuns > 0 ? settings.maxRuns : "不限"} 轮` +
+        (active && !running && !offline && !recovering ? `；计划时间：${formatAutomationTime(settings.nextRunAt || settings.firstRunAt)}` : "") +
+        `；绑定站点：${describePageBinding()}`;
+      ui.automationBadge.title = badgeStatus;
+      ui.automationBadge.setAttribute("aria-label", `自动计划：${badgeStatus}`);
+    }
   }
 
   function populateAutomationForm() {
@@ -3314,13 +3614,30 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     clearInterval(automationState.lockHeartbeat);
     releaseAutomationLock();
     automationState.cancelRequested = true;
-    automationState.settings = loadAutomationSettings();
+    automationState.settings ||= loadAutomationSettings();
     automationState.settings.enabled = false;
     automationState.settings.nextRunAt = "";
+    automationState.settings.missedRunAt = "";
     automationState.settings.lastSummary = `自动调度异常：${error?.message || String(error)}`;
-    try { saveAutomationSettings(); } catch {}
-    recordFailureLog({ type: "自动运行", node: "调度异常", reason: error });
+    persistStoppedAutomationSettings();
+    try { recordFailureLog({ type: "自动运行", node: "调度异常", reason: error }); } catch {}
+  }
+
+  function persistStoppedAutomationSettings() {
+    const settings = automationState.settings;
+    const storedPlanId = loadAutomationSettings().planId;
+    // Render before persistence/logging; storage failure must not leave a stale dot.
     renderAutomationStatus();
+    try {
+      saveAutomationSettings();
+    } catch {
+      for (const planId of [settings.planId, storedPlanId]) automationState.stoppedPlanIds.add(planId);
+      settings.lastSummary += "；停止状态保存失败，本页仍保持停止，请检查浏览器存储后重新启用。";
+      renderAutomationStatus();
+      try {
+        recordFailureLog({ type: "自动运行", node: "停止状态保存失败", reason: "浏览器存储不可写；已在本页阻止旧计划恢复，未继续发送请求。" });
+      } catch {}
+    }
   }
 
   function armAutomationTimer(notBefore = 0) {
@@ -3425,6 +3742,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     saveAutomationSettings();
     automationState.running = true;
     automationState.networkInterrupted = false;
+    automationState.recovering = recovering;
     automationState.runningPlanId = planId;
     automationState.cancelRequested = false;
     if (!ALLOW_MULTI_TAB_AUTOMATION) {
@@ -3466,6 +3784,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       clearInterval(automationState.lockHeartbeat);
       automationState.lockHeartbeat = null;
       automationState.running = false;
+      automationState.recovering = false;
       automationState.runningPlanId = "";
       const current = loadAutomationSettings();
       automationState.settings = current;
@@ -3520,10 +3839,13 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     if (!ui.automationFirstRun.value || !Number.isFinite(first.getTime()) || first.getTime() <= Date.now()) {
       window.alert("请选择将来的首次运行日期时间。"); return;
     }
+    if (pageBindingConflict || !hasCompleteSiteContext(activeSiteContext)) {
+      window.alert(pageBindingConflict ? "本页地址与页面店铺信息不一致，请核对站点后刷新，再启用计划。" : "请先在此标签页打开目标站点的订单列表，确认绑定店铺后再启用自动计划。"); return;
+    }
     const labels = getSelectedAutomationLabels({ selected });
     const runLimitLabel = maxRuns === -1 ? "不限次数，按间隔一直运行，直到手动取消" : `${maxRuns} 轮后停止`;
     if (!window.confirm(
-      `确认启用自动运行：\n\n功能：${labels.join("、")}\n首次运行：${formatAutomationTime(first.toISOString())}\n间隔：${intervalMinutes} 分钟\n总共运行：${runLimitLabel}（所选按钮合计一轮）\n\n将发送真实请求。重新启用会建立新计划，累计次数从 0 开始。${ALLOW_MULTI_TAB_AUTOMATION ? "同店铺多个页面同时运行，可能重复提交同一订单。" : ""}是否确认？`
+      `确认启用自动运行：\n\n绑定站点：${describePageBinding()}\n功能：${labels.join("、")}\n首次运行：${formatAutomationTime(first.toISOString())}\n间隔：${intervalMinutes} 分钟\n总共运行：${runLimitLabel}（所选按钮合计一轮）\n\n将发送真实请求。重新启用会建立新计划，累计次数从 0 开始。${ALLOW_MULTI_TAB_AUTOMATION ? "同店铺多个页面同时运行，可能重复提交同一订单。" : ""}是否确认？`
     )) return;
     if (first.getTime() <= updateAutomationFirstRunMin()) {
       window.alert("确认期间首次运行时间已过，请重新选择未来时间。原有计划未改变。"); return;
@@ -3540,7 +3862,13 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       firstRunAt: first.toISOString(), nextRunAt: first.toISOString(),
       intervalMinutes, maxRuns, selected, lastSummary: "等待首次计划时间",
     };
-    saveAutomationSettings();
+    try {
+      saveAutomationSettings();
+    } catch (error) {
+      handleAutomationError(error);
+      window.alert("自动计划未启用：浏览器无法保存设置。当前计划已停止，请检查浏览器存储后重试。");
+      return;
+    }
     recordSuccessLog({
       type: "自动运行", node: "启用新计划",
       reason: `${labels.join("、")}；首次 ${formatAutomationTime(first.toISOString())}；每 ${intervalMinutes} 分钟；${runLimitLabel}。`,
@@ -3559,11 +3887,11 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     settings.missedRunAt = "";
     if (hadPlan) settings.lastSummary = reason + (automationState.running ? " 已发出的请求可能仍会完成，后续请求不再发送。" : "");
     automationState.settings = settings;
-    if (hadPlan) saveAutomationSettings();
+    if (hadPlan) persistStoppedAutomationSettings();
     if (!automationState.running) releaseAutomationLock();
-    if (hadPlan) recordSuccessLog({
-      type: "自动运行", node, reason: `已启动 ${settings.startedRuns} 轮；${settings.lastSummary}`,
-    });
+    if (hadPlan) {
+      try { recordSuccessLog({ type: "自动运行", node, reason: `已启动 ${settings.startedRuns} 轮；${settings.lastSummary}` }); } catch {}
+    }
     renderAutomationStatus();
   }
 
@@ -3576,7 +3904,13 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     const settings = automationState.settings;
     if (ALLOW_MULTI_TAB_AUTOMATION) {
       // 首次载入锁定本页快照，后续其它页面保存默认参数不会改变本页计划。
-      sessionStorage.setItem(AUTOMATION_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+      try {
+        sessionStorage.setItem(AUTOMATION_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+      } catch (error) {
+        handleAutomationError(error);
+        populateAutomationForm();
+        return;
+      }
     }
     clearAutomationTimer();
     if (settings.enabled || settings.nextRunAt || settings.missedRunAt) {
@@ -3613,6 +3947,13 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       row.append(siteCell, currencyCell, limitCell, exportCell);
       ui.settingsRows.append(row);
     }
+    ui.settingsExportDate.value = siteSettings.exportStart.date;
+    ui.settingsExportDate.max = formatExportTime(Date.now()).slice(0, 10);
+    ui.settingsExportTime.value = siteSettings.exportStart.time;
+    const hasExportStart = Boolean(siteSettings.exportStart.date || siteSettings.exportStart.time);
+    ui.settingsExportTimeControls.hidden = !hasExportStart;
+    ui.settingsExportTimeToggle.setAttribute("aria-expanded", String(hasExportStart));
+    ui.settingsExportTimeZone.textContent = `浏览器时区：${Intl.DateTimeFormat().resolvedOptions().timeZone}；起始时间至点击导出的当前时间。全部留空：所有保留日志。`;
     syncExportSelectAll();
     setSettingsFeedback();
   }
@@ -3655,6 +3996,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const updated = {
         thresholds,
         exportSites: selectedExportSitesFromForm(),
+        exportStart: exportStartFromForm(),
       };
       const backupWarning = persistSiteSettings(updated);
       setSettingsFeedback(`设置已保存。${backupWarning}`, Boolean(backupWarning));
@@ -3677,12 +4019,14 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   }
 
   async function exportLogsFromSettings(mode = "full") {
+    const exportedAt = Date.now();
     ui.settingsExport.disabled = true;
     ui.settingsExportNormal.disabled = true;
     try {
       const selected = selectedExportSitesFromForm();
       if (!selected.length) throw new Error("请至少勾选一个需要导出日志的站点。");
-      const result = await exportPersistentLogs({ siteIds: selected, mode });
+      const exportStart = exportStartFromForm(exportedAt);
+      const result = await exportPersistentLogs({ siteIds: selected, mode, exportStart, exportedAt });
       setSettingsFeedback(
         `已发起下载 ${result.entryCount} 条日志，${result.fileCount} 个 CSV。` +
         (result.fileCount > 1 ? "如浏览器询问，请允许此站点下载多个文件。" : ""),
@@ -3693,6 +4037,11 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       ui.settingsExport.disabled = false;
       ui.settingsExportNormal.disabled = false;
     }
+  }
+
+  function exportStartFromForm(now = Date.now()) {
+    const parsed = parseExportStart({ date: ui.settingsExportDate.value, time: ui.settingsExportTime.value }, now);
+    return { date: parsed.date, time: parsed.time };
   }
 
   function createInterface() {
@@ -3758,10 +4107,13 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #tool-log { --tts-launcher-button: #7c3aed; --tts-launcher-button-hover: #8b5cf6; }
         #tool-settings { --tts-launcher-button: #475569; --tts-launcher-button-hover: #64748b; }
         #tool-automation { --tts-launcher-button: #f97316; --tts-launcher-button-hover: #ea580c; position: relative; }
-        #tool-automation.running::after {
-          content: ""; position: absolute; top: 4px; right: 4px; width: 8px; height: 8px;
-          border-radius: 50%; background: #fff; pointer-events: none;
+        #automation-plan-badge {
+          position: absolute; top: 4px; right: 4px; width: 8px; height: 8px;
+          border-radius: 50%; background: #fff; cursor: help;
         }
+        #automation-plan-badge[hidden] { display: none; }
+        #automation-plan-badge[data-state="offline"] { background: #64748b; }
+        #automation-plan-badge[data-state="recovering"] { background: #2563eb; }
         #overlay, #delivered-overlay, #refund-only-overlay, #log-overlay, #automation-overlay, #settings-overlay {
           display: none; position: fixed; inset: 0; z-index: 2147483647;
           align-items: center; justify-content: center; padding: 24px;
@@ -3854,6 +4206,12 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         .settings-table th, .settings-table td { padding: 10px 6px; border-bottom: 1px solid #e2e8f0; text-align: left; }
         .settings-table input[type="text"] { width: 145px; }
         .settings-form select, .settings-form input[type="text"] { font: inherit; padding: 7px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; }
+        #settings-export-time-controls { display: grid; gap: 8px; padding: 12px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fff; }
+        #settings-export-time-controls[hidden] { display: none; }
+        .export-time-fields { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+        .export-time-fields label { display: flex; align-items: center; gap: 7px; }
+        #settings-export-date { font: inherit; padding: 7px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; }
+        #settings-export-time { width: 125px; }
         #settings-feedback { font-size: 13px; margin-right: auto; }
         #settings-feedback[hidden] { display: none; }
         #settings-feedback.ok { color: #166534; }
@@ -3866,7 +4224,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <button id="tool-return-refund" class="tool-button" type="button">退货退款</button>
           <button id="tool-log" class="tool-button" type="button" title="查看操作日志">Log</button>
           <button id="tool-settings" class="tool-button" type="button">设置</button>
-          <button id="tool-automation" class="tool-button" type="button" title="设置自动运行">自动</button>
+          <button id="tool-automation" class="tool-button" type="button" aria-label="自动" title="设置自动运行">自动<span id="automation-plan-badge" role="img" aria-label="自动计划已停止" hidden></span></button>
         </div>
       </div>
       <div id="delivered-overlay" role="dialog" aria-labelledby="delivered-title">
@@ -3955,7 +4313,11 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="settings-form">
             <p class="hint">阈值比较商品原金额，应用于仅退款和退货退款的 10% 部分退款；按钮2的拒绝操作不受金额阈值影响。</p>
             <table class="settings-table"><thead><tr><th>站点</th><th>币种与精度</th><th>金额阈值</th><th>导出日志</th></tr></thead><tbody id="settings-rows"></tbody></table>
-            <div class="toolbar automation-actions"><span id="settings-feedback" role="status" aria-live="polite" hidden></span><button id="settings-save" type="button">保存设置</button><button id="settings-export" type="button">导出全量 CSV</button><button id="settings-export-normal" type="button">导出普通 CSV</button><label><input id="settings-select-all" type="checkbox">全选／全不选</label></div>
+            <div id="settings-export-time-controls" hidden>
+              <div class="export-time-fields toolbar"><label>起始日期<input id="settings-export-date" type="date"></label><label>起始时间<input id="settings-export-time" type="text" inputmode="text" placeholder="19.50.20" maxlength="8" autocomplete="off"></label><button id="settings-export-time-clear" type="button">不限起始时间</button></div>
+              <p id="settings-export-time-zone" class="hint"></p>
+            </div>
+            <div class="toolbar automation-actions"><span id="settings-feedback" role="status" aria-live="polite" hidden></span><button id="settings-save" type="button">保存设置</button><button id="settings-export-time-toggle" type="button" aria-expanded="false" aria-controls="settings-export-time-controls">导出时间</button><button id="settings-export" type="button">导出全量 CSV</button><button id="settings-export-normal" type="button">导出普通 CSV</button><label><input id="settings-select-all" type="checkbox">全选／全不选</label></div>
           </div>
         </section>
       </div>
@@ -4020,8 +4382,15 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       settingsSave: root.getElementById("settings-save"),
       settingsExport: root.getElementById("settings-export"),
       settingsExportNormal: root.getElementById("settings-export-normal"),
+      settingsExportTimeToggle: root.getElementById("settings-export-time-toggle"),
+      settingsExportTimeControls: root.getElementById("settings-export-time-controls"),
+      settingsExportDate: root.getElementById("settings-export-date"),
+      settingsExportTime: root.getElementById("settings-export-time"),
+      settingsExportTimeClear: root.getElementById("settings-export-time-clear"),
+      settingsExportTimeZone: root.getElementById("settings-export-time-zone"),
       settingsSelectAll: root.getElementById("settings-select-all"),
       automationTool: root.getElementById("tool-automation"),
+      automationBadge: root.getElementById("automation-plan-badge"),
       deliveredOverlay: root.getElementById("delivered-overlay"),
       deliveredRefresh: root.getElementById("delivered-refresh"),
       deliveredSendAll: root.getElementById("delivered-send-all"),
@@ -4396,6 +4765,16 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     });
     ui.settingsClose.addEventListener("click", closeSettings);
     ui.settingsSave.addEventListener("click", saveSiteSettingsFromForm);
+    ui.settingsExportTimeToggle.addEventListener("click", () => {
+      ui.settingsExportTimeControls.hidden = !ui.settingsExportTimeControls.hidden;
+      ui.settingsExportTimeToggle.setAttribute("aria-expanded", String(!ui.settingsExportTimeControls.hidden));
+      if (!ui.settingsExportTimeControls.hidden) ui.settingsExportTime.focus();
+    });
+    ui.settingsExportTimeClear.addEventListener("click", () => {
+      ui.settingsExportDate.value = "";
+      ui.settingsExportTime.value = "";
+      setSettingsFeedback("本次导出不限起始时间；点击保存设置可保留此选择。");
+    });
     ui.settingsExport.addEventListener("click", () => exportLogsFromSettings("full"));
     ui.settingsExportNormal.addEventListener("click", () => exportLogsFromSettings("normal"));
     ui.settingsOverlay.addEventListener("click", (event) => {
@@ -4470,6 +4849,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       renderAutomationStatus();
     });
     window.addEventListener("online", () => {
+      renderAutomationStatus();
       runAutomationCycle().catch(handleAutomationError);
     });
 
