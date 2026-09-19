@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.20.1
+// @version      0.20.2
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.20.1";
+  const APP_VERSION = "0.20.2";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -1233,6 +1233,16 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     };
   }
 
+  function hasExcludedReturnRefundAction(blocks) {
+    // Scope this exclusion to actual order actions, not unrelated status/reason values.
+    // Mixed action lists still exclude the card; do not infer capabilities from null labels.
+    return blocks.some((block) => block?.name === "button_block" &&
+      Array.isArray(block.content) && block.content.some((item) => {
+        const value = item?.button?.value;
+        return value === 17 || (typeof value === "string" && value.trim() === "17");
+      }));
+  }
+
   function extractEligibleOrders(responseData) {
     const context = contextForResponse(responseData);
     const cards = Array.isArray(responseData?.data?.cards)
@@ -1254,7 +1264,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           Object.prototype.hasOwnProperty.call(statusBlock, "content"),
       );
 
-      if (!isWaitingForCustomerReturn || hasStatusContent) continue;
+      if (!isWaitingForCustomerReturn || hasStatusContent || hasExcludedReturnRefundAction(blocks)) continue;
 
       const mainOrderId = String(entry?.biz_data?.main_order_id || "").trim();
       const reverseMainOrderId = String(
@@ -3528,7 +3538,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     ui.automationTool?.classList.toggle("running", running);
     ui.automationTool?.setAttribute("aria-pressed", String(active));
     ui.automationTool?.setAttribute("aria-busy", String(running));
-    ui.automationTool?.setAttribute("title", `自动运行：${stateText}；已启动 ${settings.startedRuns}/${settings.maxRuns > 0 ? settings.maxRuns : "不限"} 轮`);
     if (ui.automationBadge) {
       ui.automationBadge.hidden = !active;
       ui.automationBadge.dataset.state = offline ? "offline" : recovering ? "recovering" : "enabled";
@@ -4107,7 +4116,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #tool-automation { --tts-launcher-button: #f97316; --tts-launcher-button-hover: #ea580c; position: relative; }
         #automation-plan-badge {
           position: absolute; top: 4px; right: 4px; width: 8px; height: 8px;
-          border-radius: 50%; background: #fff; cursor: help;
+          border-radius: 50%; background: #fff; cursor: default;
         }
         #automation-plan-badge[hidden] { display: none; }
         #automation-plan-badge[data-state="offline"] { background: #64748b; }
@@ -4215,14 +4224,14 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #settings-feedback.ok { color: #166534; }
         #settings-feedback.error { color: #991b1b; }
       </style>
-      <div id="launcher" aria-label="卖家工具箱" title="拖动按钮区域可移动工具箱">
+      <div id="launcher" aria-label="卖家工具箱">
         <div class="tool-buttons">
-          <button id="tool-delivered" class="tool-button" type="button" title="打开已送达待核发退款列表">已送达</button>
-          <button id="tool-refund-only" class="tool-button" type="button" title="打开仅退款待核发列表">仅退款</button>
+          <button id="tool-delivered" class="tool-button" type="button">已送达</button>
+          <button id="tool-refund-only" class="tool-button" type="button">仅退款</button>
           <button id="tool-return-refund" class="tool-button" type="button">退货退款</button>
-          <button id="tool-log" class="tool-button" type="button" title="查看操作日志">Log</button>
+          <button id="tool-log" class="tool-button" type="button">Log</button>
           <button id="tool-settings" class="tool-button" type="button">设置</button>
-          <button id="tool-automation" class="tool-button" type="button" aria-label="自动" title="设置自动运行">自动<span id="automation-plan-badge" role="img" aria-label="自动计划已停止" hidden></span></button>
+          <button id="tool-automation" class="tool-button" type="button" aria-label="自动">自动<span id="automation-plan-badge" role="img" aria-label="自动计划已停止" hidden></span></button>
         </div>
       </div>
       <div id="delivered-overlay" role="dialog" aria-labelledby="delivered-title">
@@ -4248,7 +4257,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="title">退货退款｜待客户退货 · 10% 部分退款</h2>
-              <p class="hint">状态为“待客户退货”且没有状态字段；按不同站点金额阈值分区，待处理区不参与一键及自动发送。</p>
+              <p class="hint">状态为“待客户退货”且没有状态内容，排除按钮操作值为 17 的订单；按站点金额阈值分区，待处理区不参与一键及自动发送。</p>
               <p id="summary"></p>
             </div>
             <div class="toolbar">
