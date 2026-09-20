@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.20.2
+// @version      0.20.3
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.20.2";
+  const APP_VERSION = "0.20.3";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -99,6 +99,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     lastListRequestBody: null,
     lastListResponse: null,
     listSource: "",
+    listOwner: "page",
+    listGeneration: 0,
     eligibleOrders: [],
     totalCount: 0,
     fetchedCount: 0,
@@ -113,6 +115,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     lastListRequestBody: null,
     lastListResponse: null,
     listSource: "",
+    listOwner: "page",
+    listGeneration: 0,
     orders: [],
     totalCount: 0,
     fetchedCount: 0,
@@ -126,6 +130,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     lastListRequestBody: null,
     lastListResponse: null,
     listSource: "",
+    listOwner: "page",
+    listGeneration: 0,
     orders: [],
     totalCount: 0,
     fetchedCount: 0,
@@ -171,7 +177,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   let pageSiteWatchTimer = null;
   const responseContexts = new WeakMap();
   const boundSdkRequests = new Map();
-  const observedFetchFunctions = new WeakSet();
+  let activeListFetchObserver = null;
   let verifiedListRevision = -1;
   let verifiedFetch = null;
   let pageBindingConflict = false;
@@ -296,6 +302,10 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       deliveredState.orders = [];
       refundOnlyState.orders = [];
       state.lastListResponse = deliveredState.lastListResponse = refundOnlyState.lastListResponse = null;
+      for (const listState of [state, deliveredState, refundOnlyState]) {
+        listState.listGeneration += 1;
+        listState.listOwner = "page";
+      }
     }
     activeSiteContext = next;
     if (sellerChanged || regionChanged) {
@@ -1656,9 +1666,22 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     return true;
   }
 
+  function takeToolboxListOwnership(listState) {
+    // Keep ownership even if refresh fails: a late single page must never
+    // masquerade as the full result or replace the last successful snapshot.
+    listState.listGeneration += 1;
+    listState.listOwner = "toolbox";
+  }
+
+  function canApplyPageListResponse(listState, generations) {
+    return listState.listOwner === "page" &&
+      generations.get(listState) === listState.listGeneration &&
+      !listState.loading && !listState.bulkSending;
+  }
+
   function installListFetchObserver() {
     const originalFetch = window.fetch;
-    if (typeof originalFetch !== "function" || observedFetchFunctions.has(originalFetch)) return;
+    if (typeof originalFetch !== "function" || originalFetch === activeListFetchObserver) return;
 
     window.fetch = async function sellerToolsFetchObserver(input, init) {
       const rawUrl = input instanceof Request ? input.url : String(input);
@@ -1672,6 +1695,21 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const requestId = new Headers(headers).get(TOOLBOX_REQUEST_HEADER);
       const ticket = requestId ? boundSdkRequests.get(requestId) : null;
       if (requestId && !ticket) throw new Error("工具箱请求标记已失效，已阻止此旧请求。");
+      // A newer observer may surround an SDK wrapper which still calls this
+      // older one. Only the active layer observes; stripped requests pass on.
+      // A cached old fetch receiving a marker must fail closed, not leak it.
+      if (sellerToolsFetchObserver !== activeListFetchObserver) {
+        if (ticket) {
+          ticket.denied = true;
+          ticket.guardError ||= siteRoutingError("SDK 使用了过期的请求监听器，已阻止发送，请刷新本页列表后重试。");
+          throw ticket.guardError;
+        }
+        return originalFetch.apply(this, arguments);
+      }
+      // Capture ownership before any await, including Request body parsing.
+      const pageListGenerations = isListRequest && !ticket
+        ? new Map([state, deliveredState, refundOnlyState].map((listState) => [listState, listState.listGeneration]))
+        : null;
       const bodyPromise = isListRequest || ticket
         ? readFetchBody(input, init)
         : Promise.resolve(null);
@@ -1701,7 +1739,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const requestRevision = siteContextRevision;
       const belongsToPage = requestContext && !contextsConflict(requestContext, activeSiteContext);
       if (belongsToPage) latestListContext = requestContext;
-      const isToolboxListRequest = Boolean(ticket);
 
       let response;
       if (ticket) {
@@ -1716,37 +1753,29 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         catch (error) { ticket.denied = true; ticket.guardError ||= error; throw error; }
       }
 
-      if (isListRequest) {
+      // Toolbox responses are consumed once by guardSdkApi / the full-page
+      // collector; no independent clone callback may republish their last page.
+      if (pageListGenerations) {
         Promise.all([bodyPromise, response.clone().json()])
           .then(([requestBody, responseData]) => {
             responseContexts.set(responseData, requestContext);
             // Ignore foreign/stale background responses; never relabel their
             // orders as this tab's bound shop or replace the active list with them.
-            if (!belongsToPage || requestRevision !== siteContextRevision) return;
-            if (!isToolboxListRequest) {
-              if (hasCompleteSiteContext(requestContext) && responseData?.code === 0) {
-                // Background page responses cannot stop an independent toolbox plan.
-                if (!listCurrencyMatchesContext(responseData, requestContext)) return;
-              }
-              if (isDeliveredListBody(requestBody)) {
-                if (!deliveredState.loading) {
-                  handleDeliveredListResponse(
-                    responseData,
-                    requestBody,
-                    "页面请求",
-                  );
-                }
-              } else if (isRefundOnlyListBody(requestBody)) {
-                if (!refundOnlyState.loading) {
-                  handleRefundOnlyListResponse(
-                    responseData,
-                    requestBody,
-                    "页面请求",
-                  );
-                }
-              } else if (!state.loading) {
-                handleListResponse(responseData, requestBody, "页面请求");
-              }
+            if (sellerToolsFetchObserver !== activeListFetchObserver ||
+                !belongsToPage || requestRevision !== siteContextRevision) return;
+            const listState = isDeliveredListBody(requestBody) ? deliveredState
+              : isRefundOnlyListBody(requestBody) ? refundOnlyState : state;
+            if (!canApplyPageListResponse(listState, pageListGenerations)) return;
+            if (hasCompleteSiteContext(requestContext) && responseData?.code === 0) {
+              // Background page responses cannot stop an independent toolbox plan.
+              if (!listCurrencyMatchesContext(responseData, requestContext)) return;
+            }
+            if (listState === deliveredState) {
+              handleDeliveredListResponse(responseData, requestBody, "页面请求");
+            } else if (listState === refundOnlyState) {
+              handleRefundOnlyListResponse(responseData, requestBody, "页面请求");
+            } else {
+              handleListResponse(responseData, requestBody, "页面请求");
             }
           })
           .catch((error) => {
@@ -1756,7 +1785,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
       return response;
     };
-    observedFetchFunctions.add(window.fetch);
+    activeListFetchObserver = window.fetch;
   }
 
   installListFetchObserver();
@@ -1982,6 +2011,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   async function refreshOrderList() {
     if (state.loading) return state.eligibleOrders;
+    takeToolboxListOwnership(state);
     state.loading = true;
     renderStatus("正在通过 Reverse SDK 分页获取退货列表……");
     renderOrders();
@@ -2019,8 +2049,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const fallbackAvailable = Boolean(state.lastListResponse);
       renderStatus(
         fallbackAvailable
-          ? `刷新失败，继续显示最近一次页面数据：${error?.message || String(error)}`
-          : `获取失败：${error?.message || String(error)}\n请先打开退货/退款列表页面并刷新一次。`,
+          ? `刷新失败，上次列表未更新：${error?.message || String(error)}\n请核对本页站点后，再点击工具箱的“刷新列表”重试。`
+          : `获取失败：${error?.message || String(error)}\n请先在本页打开目标站点的退货/退款页面，再点击工具箱的“刷新列表”重试。`,
         "error",
       );
       renderOrders();
@@ -2053,6 +2083,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   async function refreshDeliveredList() {
     if (deliveredState.loading) return deliveredState.orders;
+    takeToolboxListOwnership(deliveredState);
     deliveredState.loading = true;
     renderDeliveredStatus("正在通过 Reverse SDK 分页获取已送达列表……");
     renderDeliveredOrders();
@@ -2089,8 +2120,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const fallbackAvailable = Boolean(deliveredState.lastListResponse);
       renderDeliveredStatus(
         fallbackAvailable
-          ? `刷新失败，继续显示最近一次数据：${error?.message || String(error)}`
-          : `获取失败：${error?.message || String(error)}\n请先打开退货/退款列表页面并刷新一次。`,
+          ? `刷新失败，上次列表未更新：${error?.message || String(error)}\n请核对本页站点后，再点击工具箱的“刷新列表”重试。`
+          : `获取失败：${error?.message || String(error)}\n请先在本页打开目标站点的退货/退款页面，再点击工具箱的“刷新列表”重试。`,
         "error",
       );
       renderDeliveredOrders();
@@ -2126,6 +2157,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
 
   async function refreshRefundOnlyList() {
     if (refundOnlyState.loading) return refundOnlyState.orders;
+    takeToolboxListOwnership(refundOnlyState);
     refundOnlyState.loading = true;
     renderRefundOnlyStatus("正在通过 Reverse SDK 分页获取仅退款列表……");
     renderRefundOnlyOrders();
@@ -2165,8 +2197,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const fallbackAvailable = Boolean(refundOnlyState.lastListResponse);
       renderRefundOnlyStatus(
         fallbackAvailable
-          ? `刷新失败，继续显示最近一次数据：${error?.message || String(error)}`
-          : `获取失败：${error?.message || String(error)}\n请先打开退货/退款列表页面并刷新一次。`,
+          ? `刷新失败，上次列表未更新：${error?.message || String(error)}\n请核对本页站点后，再点击工具箱的“刷新列表”重试。`
+          : `获取失败：${error?.message || String(error)}\n请先在本页打开目标站点的退货/退款页面，再点击工具箱的“刷新列表”重试。`,
         "error",
       );
       renderRefundOnlyOrders();
