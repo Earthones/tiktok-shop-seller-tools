@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.20.3
+// @version      0.20.4
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.20.3";
+  const APP_VERSION = "0.20.4";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -1269,12 +1269,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       const productBlock = blocks.find((block) => block?.name === "product_block");
       const statusMessages = collectMessageContents(statusBlock?.title);
       const isWaitingForCustomerReturn = statusMessages.includes(TARGET_STATUS);
-      const hasStatusContent = Boolean(
-        statusBlock &&
-          Object.prototype.hasOwnProperty.call(statusBlock, "content"),
-      );
 
-      if (!isWaitingForCustomerReturn || hasStatusContent || hasExcludedReturnRefundAction(blocks)) continue;
+      if (!isWaitingForCustomerReturn || hasExcludedReturnRefundAction(blocks)) continue;
 
       const mainOrderId = String(entry?.biz_data?.main_order_id || "").trim();
       const reverseMainOrderId = String(
@@ -4289,7 +4285,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <div class="topbar">
             <div class="title-group">
               <h2 id="title">退货退款｜待客户退货 · 10% 部分退款</h2>
-              <p class="hint">状态为“待客户退货”且没有状态内容，排除按钮操作值为 17 的订单；按站点金额阈值分区，待处理区不参与一键及自动发送。</p>
+              <p class="hint">状态为“待客户退货”，不限制状态内容，排除按钮操作值为 17 的订单；按站点金额阈值分区，待处理区不参与一键及自动发送。</p>
               <p id="summary"></p>
             </div>
             <div class="toolbar">
