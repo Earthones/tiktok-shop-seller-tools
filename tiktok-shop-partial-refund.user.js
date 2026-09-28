@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         TikTok Shop 卖家工具箱
 // @namespace    local.codex.tiktok-shop
-// @version      0.21.0
+// @version      0.20.4
 // @homepageURL  https://github.com/Earthones/tiktok-shop-seller-tools
 // @updateURL    https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
 // @downloadURL  https://raw.githubusercontent.com/Earthones/tiktok-shop-seller-tools/main/tiktok-shop-partial-refund.user.js
-// @description  Alt+T 显示或隐藏卖家工具箱；接收包裹只读预览、页级店铺绑定、自动计划状态、按时间导出 CSV，刷新或本页切站停止自动计划。
+// @description  Alt+T 显示或隐藏卖家工具箱；页级店铺绑定、计划状态指示、按时间导出 CSV，刷新或本页切站停止自动计划。
 // @match        https://seller.tiktokshopglobalselling.com/*
 // @match        https://seller-vn.tiktok.com/*
 // @run-at       document-start
@@ -16,7 +16,7 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "0.21.0";
+  const APP_VERSION = "0.20.4";
   const REFUND_PERCENT = 10;
   const PAGE_SIZE = 20;
   const MAX_PAGES = 100;
@@ -140,17 +140,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     pageSizes: [],
     loading: false,
     bulkSending: false,
-  };
-  // Preview only: never shares candidate state or action methods with buttons 1–3.
-  const receiveParcelState = {
-    lastListResponse: null,
-    orders: [],
-    totalCount: 0,
-    fetchedCount: 0,
-    pagesFetched: 0,
-    pageOffsets: [],
-    pageSizes: [],
-    loading: false,
   };
   const activityLogState = {
     entries: loadActivityLogs(),
@@ -312,9 +301,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       state.eligibleOrders = [];
       deliveredState.orders = [];
       refundOnlyState.orders = [];
-      receiveParcelState.orders = [];
-      receiveParcelState.lastListResponse = null;
-      renderReceiveParcelStatus("站点或店铺已切换，请在当前站点重新刷新预览列表。");
       state.lastListResponse = deliveredState.lastListResponse = refundOnlyState.lastListResponse = null;
       for (const listState of [state, deliveredState, refundOnlyState]) {
         listState.listGeneration += 1;
@@ -323,7 +309,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     }
     activeSiteContext = next;
     if (sellerChanged || regionChanged) {
-      renderOrders(); renderDeliveredOrders(); renderRefundOnlyOrders(); renderReceiveParcelOrders();
+      renderOrders(); renderDeliveredOrders(); renderRefundOnlyOrders();
     }
     return { ...next };
   }
@@ -360,10 +346,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         verifiedListRevision = -1;
         verifiedFetch = null;
         stopAutomation({ node: "本页站点冲突停止", reason: "本页地址与页面店铺信息不一致，已停止计划并阻止请求，请核对本页站点后刷新。" });
-        receiveParcelState.orders = [];
-        receiveParcelState.lastListResponse = null;
-        renderReceiveParcelStatus("本页地址与页面店铺信息不一致，已清除接收包裹预览，请核对站点后刷新。", "error");
-        renderReceiveParcelOrders();
       }
       return;
     }
@@ -718,7 +700,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
   async function clearLogsFromInterface() {
     if (ui.logClear.disabled) return;
     if (loadAutomationSettings().enabled || automationState.running ||
-        [state, deliveredState, refundOnlyState, receiveParcelState].some((item) => item.loading || item.bulkSending)) {
+        [state, deliveredState, refundOnlyState].some((item) => item.loading || item.bulkSending)) {
       ui.logActionStatus.textContent = "请先取消自动运行，并等待当前列表获取或批量操作完成后再清空日志。";
       ui.logActionStatus.className = "show error";
       return;
@@ -1554,81 +1536,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     return orders;
   }
 
-  function receiveParcelCountdownText(statusBlock, now = Date.now()) {
-    if (!Array.isArray(statusBlock?.content)) return "";
-    for (const entry of statusBlock.content) {
-      const text = entry?.text;
-      const messages = Array.isArray(text?.dynamic_express?.items)
-        ? text.dynamic_express.items : [];
-      // A supplied target timestamp takes priority over all cached display text
-      // for this status item, even if the target has expired or is malformed.
-      const timestamps = messages.flatMap((item) => {
-        if (typeof item?.message_content !== "string") return [];
-        return [...item.message_content.matchAll(/\{\{(time\|count_down\|[^{}]+)\}\}/g)]
-          .flatMap((match) => {
-            const kvs = item.params?.[match[1]]?.kvs;
-            return kvs && Object.prototype.hasOwnProperty.call(kvs, "target_timestamp")
-              ? [{ value: kvs.target_timestamp, message: item.message_content }] : [];
-          });
-      });
-      if (timestamps.length) {
-        for (const { value, message } of timestamps) {
-          if (/已超时|已过期|倒计时结束/.test(message)) continue;
-          const timestamp = typeof value === "number" || typeof value === "string" ? Number(value) : NaN;
-          const deadline = timestamp < 1e12 ? timestamp * 1000 : timestamp;
-          if (!Number.isFinite(deadline) || deadline <= now) continue;
-          const seconds = Math.ceil((deadline - now) / 1000);
-          const parts = [
-            [Math.floor(seconds / 86400), "天"],
-            [Math.floor(seconds % 86400 / 3600), "小时"],
-            [Math.floor(seconds % 3600 / 60), "分钟"],
-            [seconds % 60, "秒"],
-          ].filter(([amount]) => amount > 0);
-          return `还剩${parts.map(([amount, unit]) => `${amount}${unit}`).join("")}`;
-        }
-        continue;
-      }
-      for (const message of [...messages.map((item) => item?.message_content), text?.content]) {
-        if (typeof message !== "string" || /已超时|已过期|倒计时结束/.test(message)) continue;
-        const visible = message.match(/(?:时间剩余|还剩)\s*[:：]?\s*((?:\d+\s*(?:天|小时|分钟|分|秒|时)\s*)+)/);
-        if (visible && [...visible[1].matchAll(/\d+/g)].some(([amount]) => Number(amount) > 0)) {
-          return visible[0].trim();
-        }
-      }
-    }
-    return "";
-  }
-
-  function extractReceiveParcelOrders(responseData) {
-    const context = contextForResponse(responseData);
-    const cards = Array.isArray(responseData?.data?.cards) ? responseData.data.cards : [];
-    const seenReverseIds = new Set();
-    const orders = [];
-    const now = Date.now();
-    for (const entry of cards) {
-      const blocks = Array.isArray(entry?.card?.blocks) ? entry.card.blocks : [];
-      const statusBlock = blocks.find((block) => block?.name === "status_block");
-      const fulfillmentBlock = blocks.find((block) => block?.name === "fulfillment_block");
-      if (!collectDisplayTexts(statusBlock?.title).includes("退款完成") ||
-          !collectDisplayTexts(fulfillmentBlock).includes("已送达")) continue;
-      const countdownText = receiveParcelCountdownText(statusBlock, now);
-      if (!countdownText) continue;
-      const mainOrderId = String(entry?.biz_data?.main_order_id || "").trim();
-      const reverseMainOrderId = String(entry?.biz_data?.reverse_main_order_id || "").trim();
-      if (!mainOrderId || !reverseMainOrderId || seenReverseIds.has(reverseMainOrderId)) continue;
-      seenReverseIds.add(reverseMainOrderId);
-      const productPrice = getProductPriceText(blocks.find((block) => block?.name === "product_block"), entry?.biz_data);
-      orders.push({
-        mainOrderId, reverseMainOrderId,
-        productPrice: productPrice || "未提供",
-        reasonText: getReasonText(blocks.find((block) => block?.name === "reason_block")) || "未提供",
-        ...orderSiteFields(productPrice, context),
-        status: "退款完成", fulfillmentStatus: "已送达", countdownText,
-      });
-    }
-    return orders;
-  }
-
   function isDeliveredListBody(requestBody) {
     const conditions = requestBody?.search_condition;
     return Boolean(
@@ -2170,54 +2077,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     };
   }
 
-  async function refreshReceiveParcelList() {
-    if (receiveParcelState.loading) return cloneSerializable(receiveParcelState.orders);
-    let requestSite = orderSiteFields("", activeSiteContext);
-    receiveParcelState.loading = true;
-    receiveParcelState.orders = [];
-    receiveParcelState.lastListResponse = null;
-    renderReceiveParcelStatus("正在获取“等待商家处理－全部”列表，仅预览，不执行接收或同意……");
-    renderReceiveParcelOrders();
-    try {
-      const guard = createRequestGuard();
-      requirePageBinding();
-      requestSite = orderSiteFields("", activeSiteContext);
-      const { api } = await loadSdk();
-      guard();
-      const pagination = await fetchAllReverseCards({
-        api,
-        label: "接收包裹预览",
-        buildRequest: buildDeliveredListRequest,
-        renderProgress: renderReceiveParcelStatus,
-      });
-      guard();
-      // Only this full, explicitly requested batch may publish preview results.
-      // Native page responses never update receiveParcelState.
-      receiveParcelState.lastListResponse = pagination.mergedResult;
-      receiveParcelState.totalCount = Number(pagination.mergedResult.data.total_count || 0);
-      receiveParcelState.fetchedCount = pagination.allCards.length;
-      receiveParcelState.pagesFetched = pagination.pagesFetched;
-      receiveParcelState.pageOffsets = [...pagination.pageOffsets];
-      receiveParcelState.pageSizes = [...pagination.pageSizes];
-      receiveParcelState.orders = extractReceiveParcelOrders(pagination.mergedResult);
-      renderReceiveParcelStatus(
-        `本次累计获取 ${pagination.allCards.length} 条（${pagination.pagesFetched} 页；${formatPaginationTrace(pagination.pageOffsets, pagination.pageSizes)}），共筛选出 ${receiveParcelState.orders.length} 条“退款完成 + 有倒计时 + 已送达”订单。仅预览，未执行接收或同意。`,
-        "ok",
-      );
-      return cloneSerializable(receiveParcelState.orders);
-    } catch (error) {
-      receiveParcelState.orders = [];
-      receiveParcelState.lastListResponse = null;
-      const reason = error?.message || String(error);
-      renderReceiveParcelStatus(`获取失败：${reason}\n请核对当前站点后刷新预览列表；本功能没有执行接收或同意。`, "error");
-      recordFailureLog({ type: "接收包裹", node: "获取预览列表", reason, order: requestSite });
-      throw error;
-    } finally {
-      receiveParcelState.loading = false;
-      renderReceiveParcelOrders();
-    }
-  }
-
   async function refreshDeliveredList() {
     if (deliveredState.loading) return deliveredState.orders;
     takeToolboxListOwnership(deliveredState);
@@ -2553,15 +2412,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     },
   });
 
-  const receiveParcelModule = Object.freeze({
-    id: "receiveParcel",
-    title: "接收包裹",
-    readOnly: true,
-    refresh: refreshReceiveParcelList,
-    getOrders: () => cloneSerializable(receiveParcelState.orders),
-    parseOrders: extractReceiveParcelOrders,
-  });
-
   window.TikTokShopSellerTools = {
     name: "TikTok Shop 卖家工具箱",
     version: APP_VERSION,
@@ -2569,7 +2419,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       delivered: deliveredModule,
       refundOnly: refundOnlyModule,
       partialRefund: partialRefundModule,
-      receiveParcel: receiveParcelModule,
     },
     logs: Object.freeze({
       getRecent: () => cloneSerializable(activityLogState.entries),
@@ -2608,66 +2457,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     valueNode.textContent = value;
     line.append(labelNode, valueNode);
     return line;
-  }
-
-  function renderReceiveParcelStatus(message, type = "") {
-    if (!ui) return;
-    ui.receiveParcelStatus.textContent = message;
-    ui.receiveParcelStatus.className = `show ${type}`.trim();
-  }
-
-  function renderReceiveParcelOrders() {
-    if (!ui) return;
-    ui.receiveParcelSummary.textContent = receiveParcelState.lastListResponse
-      ? `接口总数 ${receiveParcelState.totalCount} · 本次累计获取 ${receiveParcelState.fetchedCount} 条（${receiveParcelState.pagesFetched} 页） · ${formatPaginationTrace(
-          receiveParcelState.pageOffsets,
-          receiveParcelState.pageSizes,
-        )} · 符合 ${receiveParcelState.orders.length} 条 · 仅预览`
-      : "尚未获取接收包裹列表 · 仅预览";
-    ui.receiveParcelRefresh.disabled = receiveParcelState.loading;
-    ui.receiveParcelRefresh.textContent = receiveParcelState.loading
-      ? "获取中…"
-      : "刷新列表";
-    ui.receiveParcelOrders.replaceChildren();
-
-    if (!receiveParcelState.orders.length) {
-      const empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = receiveParcelState.loading
-        ? "正在读取接收包裹订单……"
-        : receiveParcelState.lastListResponse
-          ? "当前没有同时满足“退款完成 + 倒计时 + 退货物流已送达”的订单。"
-          : "尚无有效预览结果，请核对顶部状态并点击“刷新列表”。";
-      ui.receiveParcelOrders.append(empty);
-      return;
-    }
-
-    for (const order of receiveParcelState.orders) {
-      const card = document.createElement("article");
-      card.className = "order-card";
-      const heading = document.createElement("div");
-      heading.className = "order-heading";
-      const title = document.createElement("strong");
-      title.textContent = `订单 ${order.mainOrderId}`;
-      const badge = document.createElement("span");
-      badge.className = "badge manual";
-      badge.textContent = "仅预览";
-      heading.append(title, badge);
-
-      const details = document.createElement("div");
-      details.className = "details receive-parcel-details";
-      details.append(
-        makeInfoLine("售后退款单号", order.reverseMainOrderId),
-        makeInfoLine("处理状态", order.status),
-        makeInfoLine("倒计时（获取时）", order.countdownText, true),
-        makeInfoLine("退货物流状态", order.fulfillmentStatus, true),
-        makeInfoLine("商品价格", order.productPrice),
-        makeInfoLine("售后原因", order.reasonText),
-        makeInfoLine("来源站点", order.siteLabel || "站点未知"),
-      );
-      card.append(heading, details);
-      ui.receiveParcelOrders.append(card);
-    }
   }
 
   function renderDeliveredOrders() {
@@ -3939,7 +3728,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     }
     if (automationDueTime(settings) > Date.now() && !automationRecoveryDue(settings)) { armAutomationTimer(); return; }
     // 手动操作正忙时暂缓整轮，不从旧列表提交，也不计入次数。
-    if ([state, refundOnlyState, deliveredState, receiveParcelState].some((item) => item.loading || item.bulkSending)) {
+    if ([state, refundOnlyState, deliveredState].some((item) => item.loading || item.bulkSending)) {
       armAutomationTimer(Date.now() + 10000); return;
     }
     if (!acquireAutomationLock()) { armAutomationTimer(Date.now() + 10000); return; }
@@ -4320,7 +4109,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           --tts-launcher-surface: #ececec;
           --tts-launcher-border: #e7e7e7;
           position: fixed; right: 24px; bottom: 24px; z-index: 2147483646;
-          width: 604px; max-width: calc(100vw - 16px); border: 1px solid var(--tts-launcher-border); border-radius: 13px;
+          width: 520px; max-width: calc(100vw - 16px); border: 1px solid var(--tts-launcher-border); border-radius: 13px;
           padding: 8px; color: #fff; background: var(--tts-launcher-surface); touch-action: none;
           box-shadow: 0 8px 24px rgba(15,23,42,.22);
           font: 14px/1.2 system-ui, sans-serif; user-select: none;
@@ -4333,7 +4122,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           transform: translateX(calc(100% - 22px));
         }
         #launcher.docked.peek { transform: translateX(0); }
-        .tool-buttons { display: grid; grid-template-columns: repeat(7, 1fr); gap: 7px; }
+        .tool-buttons { display: grid; grid-template-columns: repeat(6, 1fr); gap: 7px; }
         .tool-button {
           --tts-launcher-button: #475569;
           --tts-launcher-button-hover: #64748b;
@@ -4350,7 +4139,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #tool-delivered { --tts-launcher-button: #15803d; --tts-launcher-button-hover: #16a34a; }
         #tool-refund-only { --tts-launcher-button: #2563eb; --tts-launcher-button-hover: #3b82f6; }
         #tool-return-refund { --tts-launcher-button: #dc2626; --tts-launcher-button-hover: #ef4444; }
-        #tool-receive-parcel { --tts-launcher-button: #0f766e; --tts-launcher-button-hover: #0d9488; }
         #tool-log { --tts-launcher-button: #7c3aed; --tts-launcher-button-hover: #8b5cf6; }
         #tool-settings { --tts-launcher-button: #475569; --tts-launcher-button-hover: #64748b; }
         #tool-automation { --tts-launcher-button: #f97316; --tts-launcher-button-hover: #ea580c; position: relative; }
@@ -4361,14 +4149,14 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         #automation-plan-badge[hidden] { display: none; }
         #automation-plan-badge[data-state="offline"] { background: #64748b; }
         #automation-plan-badge[data-state="recovering"] { background: #2563eb; }
-        #overlay, #delivered-overlay, #refund-only-overlay, #receive-parcel-overlay, #log-overlay, #automation-overlay, #settings-overlay {
+        #overlay, #delivered-overlay, #refund-only-overlay, #log-overlay, #automation-overlay, #settings-overlay {
           display: none; position: fixed; inset: 0; z-index: 2147483647;
           align-items: center; justify-content: center; padding: 24px;
           color: var(--tts-text); background: rgba(15,23,42,.5);
           font: 14px/1.5 system-ui, sans-serif;
         }
-        #overlay.open, #delivered-overlay.open, #refund-only-overlay.open, #receive-parcel-overlay.open, #log-overlay.open, #automation-overlay.open, #settings-overlay.open { display: flex; }
-        #panel, #delivered-panel, #refund-only-panel, #receive-parcel-panel, #log-panel, #automation-panel, #settings-panel {
+        #overlay.open, #delivered-overlay.open, #refund-only-overlay.open, #log-overlay.open, #automation-overlay.open, #settings-overlay.open { display: flex; }
+        #panel, #delivered-panel, #refund-only-panel, #log-panel, #automation-panel, #settings-panel {
           width: min(760px, 100%); max-height: calc(100vh - 48px); overflow: auto;
           border: 1px solid var(--tts-border); border-radius: 14px; padding: 22px; background: var(--tts-surface);
           box-shadow: 0 20px 60px rgba(0,0,0,.28);
@@ -4378,8 +4166,8 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         }
         .title-group { flex: 1; }
         h2 { margin: 0 0 4px; font-size: 20px; }
-        .hint, #summary, #delivered-summary, #refund-only-summary, #receive-parcel-summary, #log-summary { margin: 0; color: #64748b; }
-        #summary, #delivered-summary, #refund-only-summary, #receive-parcel-summary, #log-summary { margin-top: 5px; }
+        .hint, #summary, #delivered-summary, #refund-only-summary, #log-summary { margin: 0; color: #64748b; }
+        #summary, #delivered-summary, #refund-only-summary, #log-summary { margin-top: 5px; }
         .toolbar { display: flex; gap: 8px; }
         .toolbar button, .send-refund {
           border: 1px solid var(--tts-border); border-radius: 8px; padding: 8px 12px;
@@ -4387,7 +4175,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         }
         .toolbar button:hover:not(:disabled) { border-color: #94a3b8; }
         button:disabled { cursor: not-allowed; opacity: .58; }
-        #orders, #delivered-orders, #refund-only-orders, #receive-parcel-orders, #log-entries { display: grid; gap: 12px; margin-top: 18px; }
+        #orders, #delivered-orders, #refund-only-orders, #log-entries { display: grid; gap: 12px; margin-top: 18px; }
         .order-card {
           border: 1px solid #e2e8f0; border-radius: 10px; padding: 15px;
           background: var(--tts-card);
@@ -4413,7 +4201,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         .details { display: grid; gap: 4px; margin-top: 11px; }
         .info-line { display: flex; justify-content: space-between; gap: 16px; }
         .info-line > :first-child { color: #64748b; }
-        .log-details .info-line > :last-child, .receive-parcel-details .info-line > :last-child {
+        .log-details .info-line > :last-child {
           max-width: 72%; text-align: right; overflow-wrap: anywhere; white-space: pre-wrap;
         }
         .action-row {
@@ -4427,13 +4215,13 @@ Any problems, you can contact us and we will provide a reasonable solution`;
         .delivered-reject { border-color: #15803d; background: #15803d; }
         .refund-only-reject { border-color: #2563eb; background: #2563eb; }
         .empty { padding: 32px 12px; text-align: center; color: #64748b; }
-        #status, #delivered-status, #refund-only-status, #receive-parcel-status, #log-file-state, #log-action-status, #automation-status {
+        #status, #delivered-status, #refund-only-status, #log-file-state, #log-action-status, #automation-status {
           display: none; margin: 16px 0 0; border-radius: 8px; padding: 10px 12px;
           white-space: pre-wrap; overflow-wrap: anywhere; background: #f1f5f9;
         }
-        #status.show, #delivered-status.show, #refund-only-status.show, #receive-parcel-status.show, #log-file-state.show, #log-action-status.show, #automation-status.show { display: block; }
-        #status.ok, #delivered-status.ok, #refund-only-status.ok, #receive-parcel-status.ok, #log-file-state.ok, #log-action-status.ok, #automation-status.ok { color: #166534; background: #dcfce7; }
-        #status.error, #delivered-status.error, #refund-only-status.error, #receive-parcel-status.error, #log-file-state.error, #log-action-status.error { color: #991b1b; background: #fee2e2; }
+        #status.show, #delivered-status.show, #refund-only-status.show, #log-file-state.show, #log-action-status.show, #automation-status.show { display: block; }
+        #status.ok, #delivered-status.ok, #refund-only-status.ok, #log-file-state.ok, #log-action-status.ok, #automation-status.ok { color: #166534; background: #dcfce7; }
+        #status.error, #delivered-status.error, #refund-only-status.error, #log-file-state.error, #log-action-status.error { color: #991b1b; background: #fee2e2; }
         .automation-form { display: grid; gap: 16px; margin-top: 18px; }
         .automation-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
         .automation-option { display: flex; align-items: center; gap: 8px; border: 1px solid #e2e8f0; border-radius: 9px; padding: 12px; background: #fff; cursor: pointer; }
@@ -4469,7 +4257,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           <button id="tool-delivered" class="tool-button" type="button">已送达</button>
           <button id="tool-refund-only" class="tool-button" type="button">仅退款</button>
           <button id="tool-return-refund" class="tool-button" type="button">退货退款</button>
-          <button id="tool-receive-parcel" class="tool-button" type="button">接收包裹</button>
           <button id="tool-log" class="tool-button" type="button">Log</button>
           <button id="tool-settings" class="tool-button" type="button">设置</button>
           <button id="tool-automation" class="tool-button" type="button" aria-label="自动">自动<span id="automation-plan-badge" role="img" aria-label="自动计划已停止" hidden></span></button>
@@ -4528,23 +4315,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
           </div>
           <pre id="refund-only-status"></pre>
           <div id="refund-only-orders"></div>
-        </section>
-      </div>
-      <div id="receive-parcel-overlay" role="dialog" aria-labelledby="receive-parcel-title">
-        <section id="receive-parcel-panel">
-          <div class="topbar">
-            <div class="title-group">
-              <h2 id="receive-parcel-title">接收包裹｜退款完成（仅预览）</h2>
-              <p class="hint">等待商家处理－全部；退款完成＋倒计时＋退货物流已送达；目前仅展示，不发送接收或同意请求。</p>
-              <p id="receive-parcel-summary"></p>
-            </div>
-            <div class="toolbar">
-              <button id="receive-parcel-refresh" type="button">刷新列表</button>
-              <button id="receive-parcel-close" type="button">关闭</button>
-            </div>
-          </div>
-          <pre id="receive-parcel-status" role="status" aria-live="polite"></pre>
-          <div id="receive-parcel-orders"></div>
         </section>
       </div>
       <div id="log-overlay" role="dialog" aria-labelledby="log-title">
@@ -4638,7 +4408,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       deliveredTool: root.getElementById("tool-delivered"),
       refundOnlyTool: root.getElementById("tool-refund-only"),
       returnRefundTool: root.getElementById("tool-return-refund"),
-      receiveParcelTool: root.getElementById("tool-receive-parcel"),
       logTool: root.getElementById("tool-log"),
       settingsTool: root.getElementById("tool-settings"),
       settingsOverlay: root.getElementById("settings-overlay"),
@@ -4678,12 +4447,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       refundOnlySummary: root.getElementById("refund-only-summary"),
       refundOnlyStatus: root.getElementById("refund-only-status"),
       refundOnlyOrders: root.getElementById("refund-only-orders"),
-      receiveParcelOverlay: root.getElementById("receive-parcel-overlay"),
-      receiveParcelRefresh: root.getElementById("receive-parcel-refresh"),
-      receiveParcelClose: root.getElementById("receive-parcel-close"),
-      receiveParcelSummary: root.getElementById("receive-parcel-summary"),
-      receiveParcelStatus: root.getElementById("receive-parcel-status"),
-      receiveParcelOrders: root.getElementById("receive-parcel-orders"),
       logOverlay: root.getElementById("log-overlay"),
       logClose: root.getElementById("log-close"),
       logExport: root.getElementById("log-export"),
@@ -4877,7 +4640,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     });
 
     const openReturnRefund = () => {
-      ui.receiveParcelOverlay.classList.remove("open");
       ui.settingsOverlay.classList.remove("open");
       ui.deliveredOverlay.classList.remove("open");
       ui.refundOnlyOverlay.classList.remove("open");
@@ -4892,7 +4654,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       ui.launcher.hidden = !ui.launcher.hidden;
     };
     const openRefundOnly = () => {
-      ui.receiveParcelOverlay.classList.remove("open");
       ui.settingsOverlay.classList.remove("open");
       ui.deliveredOverlay.classList.remove("open");
       ui.overlay.classList.remove("open");
@@ -4905,7 +4666,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     const closeRefundOnly = () =>
       ui.refundOnlyOverlay.classList.remove("open");
     const openDelivered = () => {
-      ui.receiveParcelOverlay.classList.remove("open");
       ui.settingsOverlay.classList.remove("open");
       ui.overlay.classList.remove("open");
       ui.refundOnlyOverlay.classList.remove("open");
@@ -4917,21 +4677,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     };
     const closeDelivered = () =>
       ui.deliveredOverlay.classList.remove("open");
-    const openReceiveParcel = () => {
-      ui.settingsOverlay.classList.remove("open");
-      ui.deliveredOverlay.classList.remove("open");
-      ui.overlay.classList.remove("open");
-      ui.refundOnlyOverlay.classList.remove("open");
-      ui.logOverlay.classList.remove("open");
-      ui.automationOverlay.classList.remove("open");
-      ui.receiveParcelOverlay.classList.add("open");
-      renderReceiveParcelOrders();
-      refreshReceiveParcelList().catch(() => {});
-    };
-    const closeReceiveParcel = () =>
-      ui.receiveParcelOverlay.classList.remove("open");
     const openLog = () => {
-      ui.receiveParcelOverlay.classList.remove("open");
       ui.settingsOverlay.classList.remove("open");
       ui.deliveredOverlay.classList.remove("open");
       ui.overlay.classList.remove("open");
@@ -4945,7 +4691,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     };
     const closeLog = () => ui.logOverlay.classList.remove("open");
     const openAutomation = () => {
-      ui.receiveParcelOverlay.classList.remove("open");
       ui.settingsOverlay.classList.remove("open");
       ui.deliveredOverlay.classList.remove("open");
       ui.overlay.classList.remove("open");
@@ -4957,7 +4702,7 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     const closeAutomation = () =>
       ui.automationOverlay.classList.remove("open");
     const openSettings = () => {
-      for (const overlay of [ui.overlay, ui.deliveredOverlay, ui.refundOnlyOverlay, ui.receiveParcelOverlay, ui.logOverlay, ui.automationOverlay]) overlay.classList.remove("open");
+      for (const overlay of [ui.overlay, ui.deliveredOverlay, ui.refundOnlyOverlay, ui.logOverlay, ui.automationOverlay]) overlay.classList.remove("open");
       renderSettingsForm();
       ui.settingsOverlay.classList.add("open");
     };
@@ -5004,11 +4749,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
       event.stopPropagation();
       safelyOpenTool("退货退款", openReturnRefund);
     });
-    ui.receiveParcelTool.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      safelyOpenTool("接收包裹", openReceiveParcel);
-    });
     ui.logTool.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -5022,7 +4762,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     ui.close.addEventListener("click", closeReturnRefund);
     ui.deliveredClose.addEventListener("click", closeDelivered);
     ui.refundOnlyClose.addEventListener("click", closeRefundOnly);
-    ui.receiveParcelClose.addEventListener("click", closeReceiveParcel);
     ui.logClose.addEventListener("click", closeLog);
     ui.logClear.addEventListener("click", clearLogsFromInterface);
     ui.settingsSelectAll.addEventListener("change", () => {
@@ -5049,9 +4788,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     });
     ui.refundOnlyRefresh.addEventListener("click", () => {
       refreshRefundOnlyList().catch(() => {});
-    });
-    ui.receiveParcelRefresh.addEventListener("click", () => {
-      refreshReceiveParcelList().catch(() => {});
     });
     ui.refundOnlySendAll.addEventListener("click", () => {
       processAllSupportedRefundOnlyOrders();
@@ -5087,9 +4823,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     });
     ui.refundOnlyOverlay.addEventListener("click", (event) => {
       if (event.target === ui.refundOnlyOverlay) closeRefundOnly();
-    });
-    ui.receiveParcelOverlay.addEventListener("click", (event) => {
-      if (event.target === ui.receiveParcelOverlay) closeReceiveParcel();
     });
     ui.logOverlay.addEventListener("click", (event) => {
       if (event.target === ui.logOverlay) closeLog();
@@ -5143,7 +4876,6 @@ Any problems, you can contact us and we will provide a reasonable solution`;
     renderOrders();
     renderDeliveredOrders();
     renderRefundOnlyOrders();
-    renderReceiveParcelOrders();
     renderActivityLogs();
     initializeAutomation();
 
